@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import os
 import pickle
 from pathlib import Path
 from typing import Dict, Literal, Tuple
@@ -126,10 +127,22 @@ class FBAgent:
         self.z_buffer = ZBuffer(self.cfg.train.z_buffer_size, self.cfg.model.archi.z_dim, self._model.device)
 
     def setup_compile(self):
-        print(f"compile {self.cfg.compile}")
+        print(f"compile {self.cfg.compile}", flush=True)
         if self.cfg.compile:
-            mode = "reduce-overhead" if not self.cfg.cudagraphs else None
-            print(f"compiling with mode '{mode}'")
+            distributed = False
+            try:
+                import torch.distributed as dist
+
+                distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+            except Exception:
+                distributed = False
+            if distributed:
+                # reduce-overhead captures CUDA graphs, which deadlock with the
+                # per-tensor NCCL allreduces inside the compiled updates.
+                mode = "default"
+            else:
+                mode = "reduce-overhead" if not self.cfg.cudagraphs else None
+            print(f"compiling with mode '{mode}'", flush=True)
             self.update_fb = torch.compile(self.update_fb, mode=mode)  # use fullgraph=True to debug for graph breaks
             self.update_actor = torch.compile(self.update_actor, mode=mode)  # use fullgraph=True to debug for graph breaks
             self.sample_mixed_z = torch.compile(self.sample_mixed_z, mode=mode, fullgraph=True)
@@ -385,6 +398,13 @@ class FBAgent:
         path = Path(path)
         with (path / "config.json").open() as f:
             loaded_config = json.load(f)
+        if torch.cuda.is_available() and (device is None or str(device).startswith("cuda")):
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(local_rank)
+            map_device = f"cuda:{local_rank}"
+            device = "cuda"
+        else:
+            map_device = device
         if device is not None:
             loaded_config["model"]["device"] = device
 
@@ -403,10 +423,10 @@ class FBAgent:
 
         config = cls.config_class(**loaded_config)
         agent = config.build(obs_space, action_dim)
-        optimizers = torch.load(str(path / "optimizers.pth"), weights_only=True, map_location=device)
+        optimizers = torch.load(str(path / "optimizers.pth"), weights_only=True, map_location=map_device)
         for k, v in optimizers.items():
             getattr(agent, k).load_state_dict(v)
-        safetensors.torch.load_model(agent._model, path / "model/model.safetensors", device=device, strict=False)
+        safetensors.torch.load_model(agent._model, path / "model/model.safetensors", device=map_device, strict=False)
         agent._model.train()
         agent._model.requires_grad_(True)
         return agent

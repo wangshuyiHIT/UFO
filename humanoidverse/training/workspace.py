@@ -819,7 +819,9 @@ class Workspace:
                         global_time=global_time,
                         optimizer_steps=self._optimizer_steps,
                     )
+            step_t0 = time.time()
             new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
+            step_dt = time.time() - step_t0
             if check_rollout_nonfinite:
                 _assert_finite(
                     new_td,
@@ -920,8 +922,10 @@ class Workspace:
                 )
             replay_buffer["train"].extend(data)
 
+            update_dt = 0.0
             if len(replay_buffer["train"]) > 0 and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
                 update_agent_time_checker.update_last_step(local_time)
+                update_t0 = time.time()
                 for _ in range(self.cfg.num_agent_updates):
                     metrics = self.agent.update(replay_buffer, local_time)
                     self._optimizer_steps += 1
@@ -954,6 +958,7 @@ class Workspace:
                         metric_update_counts,
                         metrics,
                     )
+                update_dt = time.time() - update_t0
 
             if log_time_checker.check(global_time) and total_metrics is not None:
                 log_time_checker.update_last_step(global_time)
@@ -992,6 +997,25 @@ class Workspace:
                 if self.train_logger is not None:
                     self.train_logger.log(m_dict)
 
+            if self.distributed_rank == 0:
+                self._pace_step_dt = getattr(self, "_pace_step_dt", 0.0) + step_dt
+                self._pace_update_dt = getattr(self, "_pace_update_dt", 0.0) + update_dt
+                pace_now = time.time()
+                pace_mark = getattr(self, "_pace_mark", None)
+                if pace_mark is None:
+                    self._pace_mark = (pace_now, int(global_time))
+                else:
+                    pace_t0, pace_g0 = pace_mark
+                    if pace_now - pace_t0 >= 30.0:
+                        pace_rate = (int(global_time) - pace_g0) / max(pace_now - pace_t0, 1e-6)
+                        print(
+                            f"[pace] global_time={int(global_time)} interval_env_steps_per_s={pace_rate:.1f} "
+                            f"sim_s={self._pace_step_dt:.2f} update_s={self._pace_update_dt:.2f}",
+                            flush=True,
+                        )
+                        self._pace_mark = (pace_now, int(global_time))
+                        self._pace_step_dt = 0.0
+                        self._pace_update_dt = 0.0
             progb.update(global_step_increment)
             td = new_td
             terminated = new_terminated

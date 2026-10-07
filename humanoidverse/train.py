@@ -34,6 +34,20 @@ def _ensure_compile_cache(cache_root: str | Path | None = None) -> None:
 
 _ensure_compile_cache()
 
+
+def _enable_fast_matmul() -> None:
+    try:
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        return
+
+
+_enable_fast_matmul()
+
 DEFAULT_AGENT = "fb"
 DEFAULT_NUM_ENVS = 1024
 DEFAULT_NUM_ENV_STEPS = 192000000
@@ -112,6 +126,8 @@ def build_ufo_mjlab_config(
     clip_grad_norm: float = 0.0,
     cartwheel_aux_safe: bool = False,
     num_agent_updates: int | None = None,
+    batch_size: int | None = None,
+    rollout_expert_trajectories_length: int | None = None,
     robot_config: str | Path | None = None,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
@@ -158,6 +174,19 @@ def build_ufo_mjlab_config(
         wandb_project=DEFAULT_WANDB_PROJECT,
     )
     agent_cfg = selected["agent_cfg"]
+    # Keep preset defaults reproducible while allowing small single-GPU runs
+    # to reduce optimizer memory and to fit short motion clips.
+    train_overrides = {}
+    if batch_size is not None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        train_overrides["batch_size"] = int(batch_size)
+    if rollout_expert_trajectories_length is not None:
+        if rollout_expert_trajectories_length <= 0:
+            raise ValueError("rollout_expert_trajectories_length must be positive")
+        train_overrides["rollout_expert_trajectories_length"] = int(rollout_expert_trajectories_length)
+    if train_overrides:
+        agent_cfg = agent_cfg.model_copy(update={"train": agent_cfg.train.model_copy(update=train_overrides)})
     wandb_group = selected["wandb_group"]
     wandb_project = selected["wandb_project"]
     train_runtime = dict(selected["train_runtime"])
@@ -318,6 +347,8 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         clip_grad_norm=args.clip_grad_norm,
         cartwheel_aux_safe=bool(args.cartwheel_aux_safe),
         num_agent_updates=args.num_agent_updates,
+        batch_size=args.batch_size,
+        rollout_expert_trajectories_length=args.rollout_expert_trajectories_length,
         robot_config=args.robot_config,
     )
     print(
@@ -462,6 +493,13 @@ def parse_args() -> argparse.Namespace:
             "2048 envs/GPU and 64 with 4096 envs/GPU to match the 1024 envs/GPU update density."
         ),
     )
+    parser.add_argument("--batch-size", type=int, default=None, help="Override agent optimizer batch size (for single-GPU memory limits).")
+    parser.add_argument(
+        "--rollout-expert-trajectories-length",
+        type=int,
+        default=None,
+        help="Override expert rollout horizon in frames; it must not exceed the shortest motion clip.",
+    )
     parser.add_argument("--disable-dr", action="store_true", help="Disable domain randomization for training.")
     parser.add_argument("--disable-obs-noise", action="store_true", help="Disable observation noise for training.")
     parser.add_argument("--lr-scale", type=float, default=1.0, help="Scale FB learning rates. TeCH preset ignores this value.")
@@ -522,6 +560,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--buffer-size must be positive")
     if args.num_agent_updates is not None and args.num_agent_updates <= 0:
         raise ValueError("--num-agent-updates must be positive")
+    if args.batch_size is not None and args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.rollout_expert_trajectories_length is not None and args.rollout_expert_trajectories_length <= 0:
+        raise ValueError("--rollout-expert-trajectories-length must be positive")
     if args.lr_scale <= 0:
         raise ValueError("--lr-scale must be positive")
     if args.clip_grad_norm < 0:

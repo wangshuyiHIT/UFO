@@ -32,12 +32,26 @@ def barrier() -> None:
 def average_gradients(parameters: Iterable[torch.nn.Parameter]) -> None:
     if not is_distributed():
         return
+    grads = [param.grad for param in parameters if param.grad is not None]
+    if not grads:
+        return
+    # One allreduce per dtype, in chunks. Same sum-and-average as per-tensor NCCL.
     scale = 1.0 / float(dist.get_world_size())
-    for param in parameters:
-        if param.grad is None:
-            continue
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        param.grad.mul_(scale)
+    buckets: dict[tuple[torch.dtype, torch.device], list[torch.Tensor]] = {}
+    for grad in grads:
+        buckets.setdefault((grad.dtype, grad.device), []).append(grad)
+    chunk_elems = 32_000_000
+    for group in buckets.values():
+        flat = torch.cat([grad.detach().reshape(-1) for grad in group])
+        for start in range(0, flat.numel(), chunk_elems):
+            piece = flat[start : start + chunk_elems]
+            dist.all_reduce(piece, op=dist.ReduceOp.SUM)
+        flat.mul_(scale)
+        offset = 0
+        for grad in group:
+            count = grad.numel()
+            grad.copy_(flat[offset : offset + count].view_as(grad))
+            offset += count
 
 
 @torch.compiler.disable
@@ -52,12 +66,30 @@ def broadcast_module_state(module: torch.nn.Module, src: int = 0) -> None:
 def sync_floating_buffers(module: torch.nn.Module, src: int = 0) -> None:
     if not is_distributed():
         return
-    scale = 1.0 / float(dist.get_world_size())
+    floating = [
+        buffer
+        for buffer in module.buffers()
+        if buffer.dtype.is_floating_point or buffer.dtype.is_complex
+    ]
+    if floating:
+        scale = 1.0 / float(dist.get_world_size())
+        buckets: dict[tuple[torch.dtype, torch.device], list[torch.Tensor]] = {}
+        for buffer in floating:
+            buckets.setdefault((buffer.dtype, buffer.device), []).append(buffer)
+        chunk_elems = 32_000_000
+        for group in buckets.values():
+            flat = torch.cat([buffer.detach().reshape(-1) for buffer in group])
+            for start in range(0, flat.numel(), chunk_elems):
+                piece = flat[start : start + chunk_elems]
+                dist.all_reduce(piece, op=dist.ReduceOp.SUM)
+            flat.mul_(scale)
+            offset = 0
+            for buffer in group:
+                count = buffer.numel()
+                buffer.copy_(flat[offset : offset + count].view_as(buffer))
+                offset += count
     for buffer in module.buffers():
-        if buffer.dtype.is_floating_point or buffer.dtype.is_complex:
-            dist.all_reduce(buffer.data, op=dist.ReduceOp.SUM)
-            buffer.data.mul_(scale)
-        else:
+        if not (buffer.dtype.is_floating_point or buffer.dtype.is_complex):
             dist.broadcast(buffer.data, src=src)
 
 

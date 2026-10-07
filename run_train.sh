@@ -52,4 +52,8 @@ export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$UFO_CACHE_DIR/cuda}"
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-$UFO_CACHE_DIR/warp}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 
-exec uv run python -m humanoidverse.train "$@"
+# Pin uv's project explicitly so this launcher also works when called through
+# an adapter (or from the Scaler repository root).  Keeping the caller's cwd
+# is intentional: work-dir and user-supplied data paths remain relative to the
+# directory from which the command was invoked.
+exec uv --project "$script_dir" run python -m humanoidverse.train "$@"
