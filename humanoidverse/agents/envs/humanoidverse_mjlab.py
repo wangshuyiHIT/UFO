@@ -902,7 +902,9 @@ class HumanoidVerseMjlabCore:
         names = [name.split("/")[-1] for name in sensor.primary_names]
         for i, name in enumerate(names):
             if name in self.body_names[: self.num_bodies]:
-                forces[:, self.body_names.index(name), :] = contact_data.force[:, i, :]
+                # Native primary/body1 netforce is exerted by this body on others.
+                # Expose the world-frame force acting on this body to UFO consumers.
+                forces[:, self.body_names.index(name), :] = -contact_data.force[:, i, :]
         return forces
 
     def _extend_body_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
