@@ -15,6 +15,7 @@ from rich.progress import track
 from scipy.spatial.transform import Rotation as sRot
 import gc
 from humanoidverse.utils.morphology import validate_morphology_config, motion_morphology_delta, morphology_offsets
+from humanoidverse.utils.motion_lib.morphology_kinematics import MorphologyKinematics, interpolate_root
 
 from humanoidverse.utils.torch_utils import(
     quat_angle_axis,
@@ -82,6 +83,7 @@ class MotionLibBase():
         self.all_morphology_delta_m = None
         if self.morphology_config:
             deltas = []
+            joint_orders = []
             for key, item in zip(self._motion_data_keys, self._motion_data_list):
                 if not isinstance(item, dict):
                     payload = joblib.load(item)
@@ -95,8 +97,14 @@ class MotionLibBase():
                     raise ValueError(f"Motion {key!r} is review-only and not qualified for training")
                 if "dof_pos" not in item:
                     raise ValueError(f"Morphology motion {key!r} requires explicit policy-order dof_pos")
+                joint_orders.append(tuple(item["joint_names"]) if "joint_names" in item else None)
                 deltas.append(motion_morphology_delta(item, self.morphology_config))
+            if len(set(joint_orders)) != 1:
+                raise ValueError("Morphology motions must declare the same policy joint_names order")
             self.all_morphology_delta_m = torch.as_tensor(np.asarray(deltas), device=self._device, dtype=torch.float32)
+            self._morphology_kinematics = MorphologyKinematics(
+                skeleton_file, self.skeleton_tree.node_names, joint_orders[0], self.morphology_config,
+                self.m_cfg.get("extend_config", []), self._device)
         self.setup_constants(fix_height = motion_lib_cfg.get("fix_height", FixHeightMode.no_fix),  multi_thread = True)
         
         self.smpl_data = None
@@ -390,6 +398,9 @@ class MotionLibBase():
         f0l = frame_idx0 + self.length_starts[motion_ids]
         f1l = frame_idx1 + self.length_starts[motion_ids]
 
+        if self.morphology_config:
+            return self._get_morphology_motion_state(motion_ids, motion_times, f0l, f1l, blend, dt, motion_len, offset)
+
         if "dof_pos" in self.__dict__:
             local_rot0 = self.dof_pos[f0l]
             local_rot1 = self.dof_pos[f1l]
@@ -493,6 +504,42 @@ class MotionLibBase():
                 delta = delta.expand(motion_times.shape[0], -1)
             return_dict["morphology_delta_m"] = delta.clone()
         return return_dict
+
+    def _get_morphology_motion_state(self, motion_ids, motion_times, f0l, f1l, blend, dt, motion_len, offset):
+        """Interpolate generalized coordinates, then derive every body feature.
+
+        Velocities are the piecewise interpolation derivatives (one-sided in
+        the selected source interval, zero at/after the final frame), not the old smoothed
+        source-body velocities. Joint and root derivatives feed the same FK
+        Jacobian, so reference pose, root/dof velocity and body velocity agree.
+        """
+        blend = blend.unsqueeze(-1)
+        inv_dt = (1.0 / dt * ((motion_times >= 0) & (motion_times < motion_len))).unsqueeze(-1)
+        dof_pos = (1-blend)*self.dof_pos[f0l] + blend*self.dof_pos[f1l]
+        dof_vel = (self.dof_pos[f1l]-self.dof_pos[f0l])*inv_dt
+        root_pos = (1-blend)*self.gts[f0l, 0] + blend*self.gts[f1l, 0]
+        root_vel = (self.gts[f1l, 0]-self.gts[f0l, 0])*inv_dt
+        root_rot, root_ang_vel = interpolate_root(self.grs[f0l, 0], self.grs[f1l, 0], blend, inv_dt)
+        if offset is not None:
+            root_pos = root_pos + offset
+        delta = self._motion_morphology_delta_m[motion_ids]
+        if delta.ndim == 1:
+            delta = delta.expand(motion_times.shape[0], -1)
+        positions, rotations, velocities, angular = self._morphology_kinematics.forward(
+            root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, delta)
+        count = self._morphology_kinematics.num_bodies
+        result = {
+            "root_pos": root_pos, "root_rot": root_rot, "root_vel": root_vel, "root_ang_vel": root_ang_vel,
+            "dof_pos": dof_pos, "dof_vel": dof_vel,
+            "motion_aa": self._motion_aa[f0l].clone(), "motion_bodies": self._motion_bodies[motion_ids].clone(),
+            "rg_pos": positions[:, :count], "rb_rot": rotations[:, :count],
+            "body_vel": velocities[:, :count], "body_ang_vel": angular[:, :count],
+            "rg_pos_t": positions, "rg_rot_t": rotations, "body_vel_t": velocities, "body_ang_vel_t": angular,
+            "morphology_delta_m": delta.clone(),
+        }
+        if self.smpl_data is not None:
+            result["smpl_pose"] = (1-blend)*self._motion_smpl_poses[f0l] + blend*self._motion_smpl_poses[f1l]
+        return result
     
     def load_motions_for_training(self, max_num_seqs = None):
         if max_num_seqs is not None:
