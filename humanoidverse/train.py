@@ -129,6 +129,12 @@ def build_ufo_mjlab_config(
     batch_size: int | None = None,
     rollout_expert_trajectories_length: int | None = None,
     robot_config: str | Path | None = None,
+    checkpoint_buffer: bool | None = None,
+    transactional_checkpoints: bool = False,
+    checkpoint_reserve_gib: float = 4.0,
+    checkpoint_timeout_seconds: float = 300.0,
+    eval_every_steps: int | None = None,
+    compile_agent: bool | None = None,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
     robot_training = load_robot_training_spec(robot_config or DEFAULT_ROBOT_CONFIG)
@@ -166,7 +172,7 @@ def build_ufo_mjlab_config(
     selected = build_agent_preset(
         agent=agent,
         device=agent_device,
-        compile=not distributed_sync,
+        compile=not distributed_sync if compile_agent is None else bool(compile_agent),
         update_z_every_step=resolved_update_z_every_step,
         lr_scale=lr_scale,
         clip_grad_norm=clip_grad_norm,
@@ -190,6 +196,12 @@ def build_ufo_mjlab_config(
     wandb_group = selected["wandb_group"]
     wandb_project = selected["wandb_project"]
     train_runtime = dict(selected["train_runtime"])
+    if checkpoint_buffer is not None:
+        train_runtime["checkpoint_buffer"] = bool(checkpoint_buffer)
+    if eval_every_steps is not None:
+        if eval_every_steps <= 0:
+            raise ValueError("eval_every_steps must be positive")
+        train_runtime["eval_every_steps"] = int(eval_every_steps)
     if num_agent_updates is not None:
         if num_agent_updates <= 0:
             raise ValueError("num_agent_updates must be positive")
@@ -249,6 +261,9 @@ def build_ufo_mjlab_config(
         num_agent_updates=train_runtime["num_agent_updates"],
         checkpoint_every_steps=checkpoint_every_steps,
         checkpoint_buffer=train_runtime["checkpoint_buffer"],
+        transactional_checkpoints=transactional_checkpoints,
+        checkpoint_reserve_gib=checkpoint_reserve_gib,
+        checkpoint_timeout_seconds=checkpoint_timeout_seconds,
         prioritization=run_eval_and_prioritization,
         prioritization_min_val=0.5,
         prioritization_max_val=2.0,
@@ -350,6 +365,12 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         batch_size=args.batch_size,
         rollout_expert_trajectories_length=args.rollout_expert_trajectories_length,
         robot_config=args.robot_config,
+        checkpoint_buffer=args.checkpoint_buffer,
+        transactional_checkpoints=args.transactional_checkpoints,
+        checkpoint_reserve_gib=args.checkpoint_reserve_gib,
+        checkpoint_timeout_seconds=args.checkpoint_timeout_seconds,
+        eval_every_steps=args.eval_every_steps,
+        compile_agent=args.compile,
     )
     print(
         "[INFO] UFO train: "
@@ -453,6 +474,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     parser.add_argument("--num-env-steps", type=int, default=DEFAULT_NUM_ENV_STEPS)
     parser.add_argument("--checkpoint-every-steps", type=int, default=DEFAULT_CHECKPOINT_EVERY_STEPS)
+    parser.add_argument("--checkpoint-buffer", action=argparse.BooleanOptionalAction, default=None,
+                        help="Save replay buffers with checkpoints (preset default if omitted); disable on small cloud disks.")
+    parser.add_argument("--transactional-checkpoints", action="store_true",
+                        help="Publish complete immutable generations atomically; keep two generations. Requires a fresh work_dir or an existing transactional run.")
+    parser.add_argument("--checkpoint-reserve-gib", type=float, default=4.0,
+                        help="Free disk reserve in addition to 1.2 times a generation's estimated bytes (transactional mode).")
+    parser.add_argument("--checkpoint-timeout-seconds", type=float, default=300.0,
+                        help="Bound each distributed checkpoint coordination wait using a separate Gloo group.")
+    parser.add_argument("--eval-every-steps", type=int, default=None,
+                        help="Override the global environment-step interval between tracking evaluations.")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None,
+                        help="Compile agent networks (preset default if omitted); disable for short integration checks.")
     parser.add_argument(
         "--data-path",
         nargs="+",
@@ -558,6 +591,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--update-z-every-step must be positive")
     if args.buffer_size <= 0:
         raise ValueError("--buffer-size must be positive")
+    if args.eval_every_steps is not None and args.eval_every_steps <= 0:
+        raise ValueError("--eval-every-steps must be positive")
     if args.num_agent_updates is not None and args.num_agent_updates <= 0:
         raise ValueError("--num-agent-updates must be positive")
     if args.batch_size is not None and args.batch_size <= 0:

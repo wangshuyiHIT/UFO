@@ -96,9 +96,19 @@ class TrajectoryDictBuffer:
         )
         # set priorities to match the number of trajectories
         self.priorities = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32) / len(self.lengths)
+        self.trajectory_morphology_delta_m = None
+        if "morphology_delta_m" in self.storage:
+            delta = self.storage["morphology_delta_m"]
+            if delta.ndim != 2 or not bool(torch.isfinite(delta).all()):
+                raise ValueError("Expert morphology must be finite [frames, dimensions]")
+            self.trajectory_morphology_delta_m = delta[self.start_idx[:, 0]].clone()
+            for start, length, shape in zip(self.start_idx[:, 0], self.lengths, self.trajectory_morphology_delta_m):
+                frames = (start + torch.arange(int(length), device=self.device)) % self.capacity
+                if not bool(torch.isclose(delta[frames], shape[None], atol=1e-7, rtol=0).all()):
+                    raise ValueError("Expert morphology must stay constant within each complete trajectory")
         self._get_idxs = torch.compile(get_idxs, mode="reduce-overhead")
 
-    def sample(self, batch_size: int = 1, seq_length: int | None = None):
+    def sample(self, batch_size: int = 1, seq_length: int | None = None, morphology_delta_m: torch.Tensor | None = None):
         seq_length = seq_length or self.seq_length
         if batch_size < seq_length:
             raise ValueError(
@@ -115,14 +125,37 @@ class TrajectoryDictBuffer:
             offset = 1
         num_slices = batch_size // seq_length
         traj_idx = self.lengths >= (seq_length + offset)
-        idxs = self._get_idxs(
-            seq_length=seq_length,
-            num_slices=num_slices,
-            lengths=self.lengths[traj_idx],
-            start_idx=self.start_idx[traj_idx],
-            storage_length=self.capacity,
-            priorities=self.priorities[traj_idx],
-        )
+        if morphology_delta_m is None:
+            idxs = self._get_idxs(
+                seq_length=seq_length,
+                num_slices=num_slices,
+                lengths=self.lengths[traj_idx],
+                start_idx=self.start_idx[traj_idx],
+                storage_length=self.capacity,
+                priorities=self.priorities[traj_idx],
+            )
+        else:
+            if self.trajectory_morphology_delta_m is None:
+                raise ValueError("Matched expert sampling requires explicit morphology_delta_m metadata")
+            requested = torch.as_tensor(morphology_delta_m, device=self.device, dtype=self.trajectory_morphology_delta_m.dtype)
+            if requested.shape != (num_slices, self.trajectory_morphology_delta_m.shape[1]) or not bool(torch.isfinite(requested).all()):
+                raise ValueError("One finite morphology vector is required per requested expert sequence")
+            shapes, assignment = torch.unique(requested, dim=0, return_inverse=True)
+            idxs = torch.empty((batch_size, self.start_idx.shape[1]), device=self.device, dtype=torch.long)
+            for shape_id, shape in enumerate(shapes):
+                eligible = traj_idx & torch.isclose(self.trajectory_morphology_delta_m, shape[None], atol=1e-7, rtol=0).all(-1)
+                if not bool(eligible.any()):
+                    raise ValueError(f"No expert trajectory of morphology {shape.tolist()} is long enough for {seq_length} steps")
+                slices = (assignment == shape_id).nonzero(as_tuple=False).flatten()
+                priorities = self.priorities[eligible]
+                if float(priorities.sum()) <= 0:
+                    priorities = torch.ones_like(priorities)
+                # The matched path has a small bank of shapes. Avoid compiling a
+                # new variable-sized graph for each reset batch / subset.
+                selected = get_idxs(seq_length, len(slices), self.lengths[eligible],
+                                    self.start_idx[eligible], self.capacity, priorities)
+                rows = (slices[:, None] * seq_length + torch.arange(seq_length, device=self.device)).flatten()
+                idxs[rows] = selected
         idxs = idxs.to(torch.long).unbind(-1)
         for k in self.output_key_t:
             output[k] = tree_map(lambda x: x[idxs], self.storage[k])

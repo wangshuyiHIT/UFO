@@ -74,6 +74,7 @@ class RobotTrainingSpec:
     torso_name: str
     left_ankle_dof_names: list[str]
     right_ankle_dof_names: list[str]
+    morphology: dict[str, Any] | None = None
 
     def to_env_dict(self) -> dict[str, Any]:
         robot = self.robot
@@ -106,6 +107,7 @@ class RobotTrainingSpec:
             "torso_name": self.torso_name,
             "left_ankle_dof_names": list(self.left_ankle_dof_names),
             "right_ankle_dof_names": list(self.right_ankle_dof_names),
+            "morphology": self.morphology,
         }
 
 
@@ -199,6 +201,7 @@ def load_robot_training_spec(config_path: str | Path) -> RobotTrainingSpec:
         torso_name=torso_name,
         left_ankle_dof_names=left_ankle_dof_names,
         right_ankle_dof_names=right_ankle_dof_names,
+        morphology=training.get("morphology"),
     )
 
 

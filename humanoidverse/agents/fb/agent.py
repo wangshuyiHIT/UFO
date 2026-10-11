@@ -358,8 +358,9 @@ class FBAgent:
         )
         return preds_mean, preds_unc, preds_mean - pessimism_penalty * preds_unc
     
-    def _sample_tracking_z(self, replay_buffer, batch_dim, traj_length):
-        batch = replay_buffer["expert_slicer"].sample(batch_dim * traj_length, seq_length=traj_length)  # N*T x obs_dim
+    def _sample_tracking_z(self, replay_buffer, batch_dim, traj_length, morphology_delta_m=None):
+        kwargs = {} if morphology_delta_m is None else {"morphology_delta_m": morphology_delta_m}
+        batch = replay_buffer["expert_slicer"].sample(batch_dim * traj_length, seq_length=traj_length, **kwargs)  # N*T x obs_dim
         z = self._model.backward_map(batch["next"]["observation"])  # NT x z_dim
         z = z.view(batch_dim, traj_length, z.shape[-1])  # N x T x z_dim
         for step in range(traj_length):
@@ -367,7 +368,65 @@ class FBAgent:
             z[:, step] = z[:, step:end_idx].mean(dim=1)
         return self._model.project_z(z)  # N x T x z_dim
 
-    def maybe_update_rollout_context(self, z: torch.Tensor | None, step_count: torch.Tensor, replay_buffer: None = None) -> torch.Tensor:
+    @torch.no_grad()
+    def _update_morphology_rollout_context(self, z, step_count, replay_buffer, morphology_delta_m):
+        """Keep actual expert rollouts on the online robot's physical shape.
+
+        Mixed FB loss goals retain UFO's original sampling semantics. This path
+        only controls the reference trajectories actually executed online.
+        """
+        count = step_count.reshape(-1).to(device=self._model.device, dtype=torch.long)
+        delta = torch.as_tensor(morphology_delta_m, device=self._model.device)
+        if delta.ndim != 2 or delta.shape[0] != len(count) or not bool(torch.isfinite(delta).all()):
+            raise ValueError("Online rollout morphology must be finite [num_envs, dimensions]")
+        initialize = z is None or not hasattr(self, "_morphology_rollout") or self._morphology_rollout["num_envs"] != len(count)
+        if z is None:
+            z = self._model.sample_z(len(count), device=self._model.device)
+        else:
+            z = z.to(self._model.device).clone()
+            if self.cfg.train.use_mix_rollout and not self.z_buffer.empty():
+                new_z = self.z_buffer.sample(len(count), device=self._model.device)
+            else:
+                new_z = self._model.sample_z(len(count), device=self._model.device)
+            z = torch.where((count % self.cfg.train.update_z_every_step == 0)[:, None], new_z, z)
+        if not self.cfg.train.rollout_expert_trajectories:
+            return z
+        length = self.cfg.train.rollout_expert_trajectories_length
+        n_expert = int(self.cfg.train.rollout_expert_trajectories_percentage * len(count))
+        if not 0 <= n_expert <= len(count) or length <= 0:
+            raise ValueError("Invalid expert rollout percentage or trajectory length")
+        if n_expert == 0:
+            return z
+        if initialize:
+            env_ids = torch.randperm(len(count), device=self._model.device)[:n_expert]
+            self.env_idx_with_expert_rollout = env_ids
+            tracking = self._sample_tracking_z(replay_buffer, n_expert, length, delta[env_ids])
+            cache = {"num_envs": len(count), "env_ids": env_ids,
+                     "delta": delta[env_ids].clone(), "last_count": count[env_ids].clone(),
+                     "age": torch.zeros(n_expert, dtype=torch.long, device=count.device), "tracking": tracking}
+            self._morphology_rollout = cache
+        else:
+            cache = self._morphology_rollout
+            env_ids = cache["env_ids"]
+            elapsed = count[env_ids] - cache["last_count"]
+            age = cache["age"] + elapsed.clamp_min(0)
+            changed_shape = ~torch.isclose(delta[env_ids], cache["delta"], atol=1e-7, rtol=0).all(-1)
+            reset = (elapsed < 0) | (count[env_ids] == 0)
+            replace = reset | changed_shape | (age >= length)
+            if bool(replace.any()):
+                ids = env_ids[replace]
+                cache["tracking"][replace] = self._sample_tracking_z(replay_buffer, len(ids), length, delta[ids])
+                age[replace] = 0
+            cache["age"] = age
+            cache["last_count"] = count[env_ids].clone()
+            cache["delta"] = delta[env_ids].clone()
+        z[cache["env_ids"]] = cache["tracking"][torch.arange(n_expert, device=count.device), cache["age"]]
+        return z
+
+    def maybe_update_rollout_context(self, z: torch.Tensor | None, step_count: torch.Tensor, replay_buffer: None = None,
+                                    morphology_delta_m: torch.Tensor | None = None) -> torch.Tensor:
+        if morphology_delta_m is not None:
+            return self._update_morphology_rollout_context(z, step_count, replay_buffer, morphology_delta_m)
         # get mask for environmets where we need to change z
         if z is not None:
             mask_reset_z = step_count % self.cfg.train.update_z_every_step == 0

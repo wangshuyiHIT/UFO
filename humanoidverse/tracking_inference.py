@@ -87,7 +87,12 @@ def _target_states_from_obs(obs_dict: dict[str, torch.Tensor], device: str, *, n
     dof_state = torch.zeros((int(num_dof), 2), device=device, dtype=torch.float32)
     dof_state[:, 0] = obs_dict["dof_pos"][0].to(device=device, dtype=torch.float32)
     dof_state[:, 1] = obs_dict["ref_dof_vel"][0].to(device=device, dtype=torch.float32)
-    return {"root_states": root_state_xyzw.unsqueeze(0), "dof_states": dof_state.unsqueeze(0)}
+    target = {"root_states": root_state_xyzw.unsqueeze(0), "dof_states": dof_state.unsqueeze(0)}
+    if "morphology_delta_m" in obs_dict:
+        target["morphology_delta_m"] = obs_dict["morphology_delta_m"][0:1].to(device=device, dtype=torch.float32)
+        target["motion_ids"] = obs_dict["motion_ids"][0:1].to(device=device, dtype=torch.long)
+        target["motion_start_times"] = obs_dict["motion_start_times"][0:1].to(device=device, dtype=torch.float32)
+    return target
 
 
 @torch.no_grad()

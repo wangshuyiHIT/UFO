@@ -20,6 +20,7 @@ from ..buffers.trajectory import TrajectoryDictBufferMultiDim
 from ..envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 from .base import BaseEvalConfig, extract_model
 from humanoidverse.utils.reference_observations import reference_base_ang_vel
+from humanoidverse.utils.morphology import append_morphology_state
 
 def get_next(field: str, data: Any):
     if "next" in data and field in data["next"]:
@@ -281,6 +282,14 @@ def get_backward_observation(env, motion_id, include_last_action, velocity_multi
     if include_last_action:
         g1env_obs["last_action"] = g1env_last_action
 
+    if getattr(env, "morphology_config", None):
+        delta = motion_state["morphology_delta_m"]
+        ref_dict["morphology_delta_m"] = delta
+        ref_dict["motion_ids"] = torch.as_tensor(motion_id, device=env.device, dtype=torch.long).expand_as(motion_times)
+        ref_dict["motion_start_times"] = motion_times
+        for key in ("state", "privileged_state"):
+            g1env_obs[key] = append_morphology_state(env, g1env_obs[key], delta)
+
     return g1env_obs, ref_dict
 
 
@@ -415,6 +424,7 @@ def _async_tracking_worker(
     tracking_joint_pos = {}
     dof_states_list = [None] * num_envs
     root_states_list = [None] * num_envs
+    morphology_list = [None] * num_envs if getattr(core_env, "morphology_config", None) else None
 
     # Precompute context and target states per motion
     for m_id in motion_ids:
@@ -447,6 +457,8 @@ def _async_tracking_worker(
             dof_init_state[..., 1] = tracking_target_dict["ref_dof_vel"][0]
             dof_states_list[env_id] = dof_init_state
             root_states_list[env_id] = ref_root_init_state
+            if morphology_list is not None:
+                morphology_list[env_id] = tracking_target_dict["morphology_delta_m"][0]
             # target_xpos_dict[env_id] = tracking_target_dict["ref_body_pos"][:, : len(xpos_bodies)]
 
     # this is for environments that are not initialized
@@ -457,6 +469,14 @@ def _async_tracking_worker(
             root_states_list[i] = torch.zeros_like(root_states_list[0])
 
     target_states = {"dof_states": torch.stack(dof_states_list), "root_states": torch.stack(root_states_list)}
+    if morphology_list is not None:
+        # Group assignment must cover every world; a silent nominal fallback
+        # would invalidate the tracking result for an unassigned world.
+        if any(delta is None for delta in morphology_list):
+            raise ValueError("Morphology tracking evaluation has unassigned environments")
+        target_states["morphology_delta_m"] = torch.stack(morphology_list)
+        target_states["motion_ids"] = torch.as_tensor(assigned_motions, device=core_env.device, dtype=torch.long)
+        target_states["motion_start_times"] = torch.zeros(num_envs, device=core_env.device)
 
     env_ids = list(range(num_envs))
     env_ids = torch.tensor(env_ids, dtype=torch.long, device=core_env.device)

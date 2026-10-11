@@ -14,6 +14,7 @@ from loguru import logger
 from rich.progress import track
 from scipy.spatial.transform import Rotation as sRot
 import gc
+from humanoidverse.utils.morphology import validate_morphology_config, motion_morphology_delta, morphology_offsets
 
 from humanoidverse.utils.torch_utils import(
     quat_angle_axis,
@@ -65,6 +66,7 @@ def _dof_vel_from_dof_pos(dof_pos, dt):
 class MotionLibBase():
     def __init__(self, motion_lib_cfg, num_envs, device):
         self.m_cfg = motion_lib_cfg
+        self.morphology_config = validate_morphology_config(motion_lib_cfg.get("morphology"))
         self._sim_fps = 1/self.m_cfg.get("step_dt", 1/50)
         self.all_motions_loaded = False
         
@@ -77,6 +79,24 @@ class MotionLibBase():
         logger.info(f"Loaded skeleton from {skeleton_file}")
         logger.info(f"Loading motion data from {self.m_cfg.motion_file}...")
         self.load_data(self.m_cfg.motion_file)
+        self.all_morphology_delta_m = None
+        if self.morphology_config:
+            deltas = []
+            for key, item in zip(self._motion_data_keys, self._motion_data_list):
+                if not isinstance(item, dict):
+                    payload = joblib.load(item)
+                    item = payload[Path(str(item)).stem]
+                metadata = item.get("metadata", {})
+                evaluation_qualified = (self.morphology_config.get("motion_purpose", "training") == "evaluation"
+                                        and metadata.get("kinematic_qualified") is True
+                                        and not metadata.get("review_only", False))
+                if not self.morphology_config.get("allow_review_motions", False) and not evaluation_qualified and (
+                    metadata.get("review_only", False) or metadata.get("valid_for_training") is False):
+                    raise ValueError(f"Motion {key!r} is review-only and not qualified for training")
+                if "dof_pos" not in item:
+                    raise ValueError(f"Morphology motion {key!r} requires explicit policy-order dof_pos")
+                deltas.append(motion_morphology_delta(item, self.morphology_config))
+            self.all_morphology_delta_m = torch.as_tensor(np.asarray(deltas), device=self._device, dtype=torch.float32)
         self.setup_constants(fix_height = motion_lib_cfg.get("fix_height", FixHeightMode.no_fix),  multi_thread = True)
         
         self.smpl_data = None
@@ -467,6 +487,11 @@ class MotionLibBase():
             "body_vel_t": body_vel_t.clone(),
             "body_ang_vel_t": body_ang_vel_t.clone(),
         })
+        if self.morphology_config:
+            delta = self._motion_morphology_delta_m[motion_ids]
+            if delta.ndim == 1:
+                delta = delta.expand(motion_times.shape[0], -1)
+            return_dict["morphology_delta_m"] = delta.clone()
         return return_dict
     
     def load_motions_for_training(self, max_num_seqs = None):
@@ -547,6 +572,8 @@ class MotionLibBase():
         
         # sample_idxes = torch.tensor([self._motion_data_keys.tolist().index("0-KIT_8_WalkInClockwiseCircle04_poses")]).to(self._device)
         self._curr_motion_ids = sample_idxes
+        if self.morphology_config:
+            self._motion_morphology_delta_m = self.all_morphology_delta_m[sample_idxes]
         self.curr_motion_keys = [self._motion_data_keys[sample_idxes.cpu()]] if sample_idxes.numel() == 1 else self._motion_data_keys[sample_idxes.cpu()].tolist()
         self._refresh_sampling_batch_prob()
 
@@ -721,8 +748,18 @@ class MotionLibBase():
             
             
             if self.mesh_parsers is not None:
-                trans, trans_fix = self.fix_trans_height(pose_aa, trans, fix_height_mode = fix_height)
-                curr_motion = self.mesh_parsers.fk_batch(pose_aa[None, ], trans[None, ], return_full= True, dt = dt)
+                nominal_offsets = self.mesh_parsers._offsets
+                try:
+                    if self.morphology_config:
+                        if fix_height != FixHeightMode.no_fix:
+                            raise ValueError("Morphology motions must preserve their audited root trajectory (fix_height=no_fix)")
+                        delta = motion_morphology_delta(curr_file, self.morphology_config)
+                        self.mesh_parsers._offsets = morphology_offsets(
+                            nominal_offsets, self.mesh_parsers.body_names, self.morphology_config, delta)
+                    trans, trans_fix = self.fix_trans_height(pose_aa, trans, fix_height_mode = fix_height)
+                    curr_motion = self.mesh_parsers.fk_batch(pose_aa[None, ], trans[None, ], return_full= True, dt = dt)
+                finally:
+                    self.mesh_parsers._offsets = nominal_offsets
                 if self.smpl_data is not None:
                     skip = int(smpl_data_list[f]['fps'] // 30)
                     curr_motion['smpl_pose'] = torch.tensor(smpl_data_list[f]['pose_aa'][::skip][start:end]).float().to(self._device)

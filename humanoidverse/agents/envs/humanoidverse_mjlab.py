@@ -29,6 +29,7 @@ from humanoidverse.envs.env_utils.history_handler import HistoryHandler as HVHis
 from humanoidverse.envs.motion_observations import compute_humanoid_observations_max
 from humanoidverse.utils.helpers import pre_process_config
 from humanoidverse.utils.motion_lib.motion_lib_robot import MotionLibRobot
+from humanoidverse.utils.morphology import append_morphology_state, validate_morphology_config, MjlabMorphologyRuntime
 from humanoidverse.utils.torch_utils import (
     calc_heading_quat_inv,
     my_quat_rotate,
@@ -223,6 +224,7 @@ def _patch_humanoidverse_robot_config(config, robot_training: dict[str, Any] | N
     config.robot.motion.asset.assetRoot = str(xml_path.parent)
     config.robot.motion.asset.assetFileName = xml_path.name
     config.robot.motion.asset.urdfFileName = None
+    config.robot.motion.morphology = validate_morphology_config(robot_training.get("morphology"))
 
     extend_config = []
     for item in _to_list(config.robot.motion.get("extend_config", [])):
@@ -333,6 +335,7 @@ def _compose_humanoidverse_config(
         cfg.domain_rand.randomize_pd_gain = False
         cfg.domain_rand.randomize_base_com = False
         cfg.domain_rand.randomize_link_mass = False
+        cfg.domain_rand.randomize_base_mass = False
         cfg.domain_rand.randomize_friction = False
         cfg.domain_rand.randomize_torque_rfi = False
         cfg.domain_rand.randomize_rfi_lim = False
@@ -497,12 +500,25 @@ def make_mjlab_ufo_env_cfg(
             use_default_offset=True,
         )
     }
+    if config.robot.motion.get("morphology"):
+        from humanoidverse.agents.envs.morphology_actions import MorphologyPositionActionCfg
+        actions["actions"] = MorphologyPositionActionCfg(
+            entity_name="robot", actuator_names=dof_names, preserve_order=True,
+            scale=action_scale, use_default_offset=True,
+            domain_rand=OmegaConf.to_container(config.domain_rand, resolve=True),
+            effort_limits=tuple(effort_limits))
     reward_keys = tuple(config.rewards.reward_scales.keys())
     rewards = {key: RewardTermCfg(func=_zero_reward, weight=0.0) for key in reward_keys}
     terminations = {
         "time_out": TerminationTermCfg(func=mjlab_terminations.time_out, time_out=True),
     }
     domain_rand = config.domain_rand
+    morphology_enabled = bool(config.robot.motion.get("morphology"))
+    if morphology_enabled:
+        unsupported = [name for name in ("randomize_base_mass", "randomize_joint_armature",
+            "randomize_joint_friction", "randomize_restitution") if domain_rand.get(name, False)]
+        if unsupported:
+            raise ValueError(f"Morphology MJLab has no verified implementation for {unsupported}; disable those flags")
     events = {}
     if bool(domain_rand.get("push_robots", False)):
         max_push_vel_xy = float(domain_rand.max_push_vel_xy)
@@ -519,13 +535,17 @@ def make_mjlab_ufo_env_cfg(
                     "yaw": (-max_push_ang_vel, max_push_ang_vel),
                 }
             )
+        if domain_rand.get("push_velocity_range") is not None:
+            velocity_range = {str(k): tuple(map(float, v)) for k, v in domain_rand.push_velocity_range.items()}
+            if not set(velocity_range).issubset({"x", "y", "z", "roll", "pitch", "yaw"}):
+                raise ValueError("push_velocity_range has unknown velocity axes")
         events["push_robots"] = EventTermCfg(
             func=mjlab_mdp.push_by_setting_velocity,
             mode="interval",
             interval_range_s=tuple(float(x) for x in _to_list(domain_rand.push_interval_s)),
             params={"velocity_range": velocity_range},
         )
-    if bool(domain_rand.get("randomize_base_com", False)):
+    if bool(domain_rand.get("randomize_base_com", False)) and not morphology_enabled:
         base_com_range = domain_rand.base_com_range
         events["random_base_com"] = EventTermCfg(
             mode="startup",
@@ -540,7 +560,7 @@ def make_mjlab_ufo_env_cfg(
                 },
             },
         )
-    if bool(domain_rand.get("randomize_link_mass", False)):
+    if bool(domain_rand.get("randomize_link_mass", False)) and not morphology_enabled:
         events["random_link_mass"] = EventTermCfg(
             mode="startup",
             func=mjlab_dr.body_mass,
@@ -626,6 +646,8 @@ class HumanoidVerseMjlabCore:
         self.dt = float(mjlab_env.step_dt)
         self.sim_dt = float(mjlab_env.physics_dt)
         self._creation_config = creation_config
+        self.morphology_config = validate_morphology_config(hv_config.robot.motion.get("morphology"))
+        self.morphology_runtime = None
 
         self.dof_names = tuple(_to_list(hv_config.robot.dof_names))
         self.body_names = tuple(_to_list(hv_config.robot.body_names))
@@ -708,6 +730,16 @@ class HumanoidVerseMjlabCore:
         self.add_noise_currculum = bool(self.config.obs.get("add_noise_currculum", False))
         self.current_noise_curriculum_value = float(self.config.obs.get("noise_initial_value", 1.0))
         self._init_motion_lib()
+        if self.morphology_config:
+            import mujoco
+            torso_global_id = int(self.robot.indexing.body_ids[mjlab_body_names.index(hv_config.robot.torso_name)])
+            torso_full_name = mujoco.mj_id2name(mjlab_env.sim.mj_model, mujoco.mjtObj.mjOBJ_BODY, torso_global_id)
+            prefix = torso_full_name[:-len(str(hv_config.robot.torso_name))]
+            self.morphology_runtime = MjlabMorphologyRuntime(
+                mjlab_env.sim, self.morphology_config, self._motion_lib.all_morphology_delta_m,
+                robot_body_ids=self.robot.indexing.body_ids, torso_body_id=torso_global_id,
+                domain_rand=self.config.domain_rand, prefix=prefix)
+            self.morphology_delta_m = self.morphology_runtime.delta_m
         self.history_handler = HVHistoryHandler(self.num_envs, hv_config.obs.obs_auxiliary, hv_config.obs.obs_dims, self.device)
         self.use_contact_in_obs_max = bool(hv_config.get("use_contact_in_obs_max", False))
         self.simulator = _MjlabSimulatorView(self)
@@ -958,6 +990,9 @@ class HumanoidVerseMjlabCore:
             "state": torch.cat([raw_obs["dof_pos"], raw_obs["dof_vel"], raw_obs["projected_gravity"], raw_obs["base_ang_vel"]], dim=-1),
             "privileged_state": raw_obs["max_local_self"],
         }
+        if self.morphology_config:
+            obs["state"] = append_morphology_state(self, obs["state"])
+            obs["privileged_state"] = append_morphology_state(self, obs["privileged_state"])
         if include_last_action:
             obs["last_action"] = raw_obs["actions"]
         obs["time"] = self.episode_length_buf.unsqueeze(-1)
@@ -1069,6 +1104,19 @@ class HumanoidVerseMjlabCore:
         self.mjlab_env.reset(env_ids=env_ids)
         self._randomize_default_dof_pos_offset(env_ids)
         if target_states is not None:
+            if self.morphology_runtime is not None:
+                for key in ("morphology_delta_m", "motion_ids", "motion_start_times"):
+                    if key not in target_states:
+                        raise ValueError(f"Explicit morphology target_states requires {key} matching the reference motion")
+                motion_ids = target_states["motion_ids"][env_ids].to(self.device, dtype=torch.long)
+                delta = target_states["morphology_delta_m"][env_ids].to(self.device)
+                expected = self._motion_lib._motion_morphology_delta_m[motion_ids]
+                if not torch.allclose(delta, expected, atol=1e-7, rtol=0):
+                    raise ValueError("Target morphology disagrees with the selected reference motion")
+                self.motion_ids[env_ids] = motion_ids
+                self.motion_start_times[env_ids] = target_states["motion_start_times"][env_ids].to(self.device)
+                self.motion_len[env_ids] = self._motion_lib.get_motion_length(motion_ids)
+                self.morphology_runtime.apply(env_ids, delta, randomize=not self.is_evaluating)
             root_xyzw = target_states["root_states"][env_ids].to(self.device, dtype=torch.float32)
             dof_state = target_states["dof_states"][env_ids].to(self.device, dtype=torch.float32)
             joint_pos = dof_state[..., 0]
@@ -1077,6 +1125,8 @@ class HumanoidVerseMjlabCore:
             self._resample_motion_time_and_ids(env_ids)
             motion_times = self.motion_start_times[env_ids]
             motion_res = self._motion_lib.get_motion_state(self.motion_ids[env_ids], motion_times, offset=self.env_origins[env_ids])
+            if self.morphology_runtime is not None:
+                self.morphology_runtime.apply(env_ids, motion_res["morphology_delta_m"], randomize=not self.is_evaluating)
             root_pos = motion_res["root_pos"]
             root_rot = motion_res["root_rot"]
             root_vel = motion_res["root_vel"]
@@ -1119,6 +1169,9 @@ class HumanoidVerseMjlabCore:
         root_wxyz = torch.cat([root_xyzw[:, :3], xyzw_to_wxyz(root_xyzw[:, 3:7]), root_xyzw[:, 7:13]], dim=-1)
         self.robot.write_root_state_to_sim(root_wxyz, env_ids=env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=self._joint_ids, env_ids=env_ids)
+        if self.morphology_runtime is not None:
+            self.mjlab_env.action_manager.get_term("actions").reset_dynamics(
+                env_ids, joint_pos[:, self._action_term_dof_indices], randomize=not self.is_evaluating)
         self.mjlab_env.scene.write_data_to_sim()
         self.mjlab_env.sim.forward()
         self.mjlab_env._manual_reset_pending[env_ids] = False

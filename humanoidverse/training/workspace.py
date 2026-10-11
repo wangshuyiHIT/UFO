@@ -44,6 +44,7 @@ from humanoidverse.agents.misc.loggers import CSVLogger
 from humanoidverse.agents.tldr_dist_aux.agent import TldrDistAuxAgentConfig
 from humanoidverse.agents.utils import EveryNStepsChecker, get_local_workdir, set_seed_everywhere
 from humanoidverse.distributed import average_metrics, barrier, broadcast_agent_state, broadcast_object, module_sync_report, sync_floating_buffers
+from humanoidverse.training.checkpoint_io import CheckpointCoordinator, ReplayWarmup, resolve_checkpoint, transactional_save
 
 TRAIN_LOG_FILENAME = "train_log.txt"
 REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
@@ -118,6 +119,9 @@ class TrainConfig(BaseConfig):
     # Note: this is in env steps (multiples of online_parallel_envs)
     checkpoint_every_steps: int = 5_000_000
     checkpoint_buffer: bool = True
+    transactional_checkpoints: bool = False
+    checkpoint_reserve_gib: float = pydantic.Field(default=4.0, ge=0, allow_inf_nan=False)
+    checkpoint_timeout_seconds: float = pydantic.Field(default=300.0, gt=0, allow_inf_nan=False)
     prioritization: bool = False
     prioritization_min_val: float = 0.5
     prioritization_max_val: float = 5
@@ -165,6 +169,11 @@ class TrainConfig(BaseConfig):
     infra: dict = pydantic.Field(default_factory=dict)
 
     def model_post_init(self, context):
+        if self.transactional_checkpoints and self.distributed_world_size > 1:
+            if not self.distributed_sync or not self.rank0_only_writes:
+                raise ValueError("Transactional distributed checkpoints require distributed_sync and rank0_only_writes")
+            if self.checkpoint_buffer and not self.checkpoint_rank_buffers:
+                raise ValueError("Transactional distributed replay checkpoints require rank-local buffer shards")
         # TODO prioritization needs tracking eval to work, but this is bit hacky to check for it
         if self.load_expert_data_from_motion_lib and not isinstance(self.env, HumanoidVerseMjlabConfig):
             raise ValueError("Loading expert data from motion library is only supported for HumanoidVerseMjlabConfig")
@@ -201,7 +210,7 @@ class TrainConfig(BaseConfig):
 
 
 def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_build_kwargs: dict[str, tp.Any]):
-    checkpoint_dir = work_dir / CHECKPOINT_DIR_NAME
+    checkpoint_dir = resolve_checkpoint(work_dir, transactional=cfg.transactional_checkpoints)
     train_status_path = checkpoint_dir / "train_status.json"
     checkpoint_status = _initial_train_status(cfg)
     if train_status_path.exists():
@@ -416,6 +425,14 @@ class Workspace:
         self.distributed_rank = int(self.cfg.distributed_rank)
         self.distributed_world_size = int(self.cfg.distributed_world_size)
         self._write_shared_artifacts = (not self.cfg.rank0_only_writes) or self.distributed_rank == 0
+        self._checkpoint_coordinator = None
+        if cfg.transactional_checkpoints:
+            self._checkpoint_coordinator = CheckpointCoordinator(
+                world_size=self.distributed_world_size, timeout_seconds=cfg.checkpoint_timeout_seconds
+            )
+            self._checkpoint_coordinator.stage(
+                "resume preflight", lambda: str(resolve_checkpoint(Path(cfg.work_dir), transactional=True))
+            )
 
         # MJLab environments are created once and shared with evaluation.
         if isinstance(cfg.env, HumanoidVerseMjlabConfig):
@@ -455,6 +472,7 @@ class Workspace:
         self._checkpoint_local_time = int(self._checkpoint_status["local_time"])
         self._checkpoint_global_time = int(self._checkpoint_status["global_time"])
         self._optimizer_steps = int(self._checkpoint_status["optimizer_steps"])
+        self._last_checkpoint_position = (self._checkpoint_local_time, self._checkpoint_global_time, self._optimizer_steps)
         if self.cfg.distributed_sync:
             broadcast_agent_state(self.agent, src=0)
         self.agent._model.train()
@@ -572,7 +590,7 @@ class Workspace:
 
         print("Allocating buffers")
         replay_buffer = {}
-        checkpoint_dir = self.work_dir / CHECKPOINT_DIR_NAME
+        checkpoint_dir = resolve_checkpoint(self.work_dir, transactional=self.cfg.transactional_checkpoints)
         checkpoint_buffer_dir = self._checkpoint_buffer_path(checkpoint_dir)
         if checkpoint_buffer_dir.exists():
             print("Loading checkpointed buffer")
@@ -593,6 +611,19 @@ class Workspace:
                 )
             else:
                 replay_buffer["train"] = DictBuffer(capacity=self.cfg.buffer_size, device=self.cfg.buffer_device)
+        replay_loaded = checkpoint_buffer_dir.exists() and len(replay_buffer["train"]) > 0
+        if self._checkpoint_coordinator is not None:
+            # All ranks enter updates together, including recovery from a missing
+            # or empty rank-local shard. No reset of total/optimizer step counters.
+            replay_loaded = all(self._checkpoint_coordinator.gather(replay_loaded))
+        self._replay_warmup = ReplayWarmup.for_resume(
+            transactional=self.cfg.transactional_checkpoints,
+            resumed=(checkpoint_dir / "train_status.json").is_file(),
+            replay_loaded=replay_loaded,
+            seed_steps=self.cfg.num_seed_steps,
+        )
+        if self._replay_warmup.required_steps and self._write_shared_artifacts:
+            print(f"[checkpoint] Replay was not restored; collect {self._replay_warmup.required_steps} new local environment steps before optimizer updates (saved counters retained)", flush=True)
         if self.training_with_expert_data:
             replay_buffer["expert_slicer"] = expert_buffer
 
@@ -648,6 +679,7 @@ class Workspace:
             eval_instances.append(isinstance(evaluation, HumanoidVerseMjlabTrackingEvaluation))
         uses_humanoidverse_eval = True if any(eval_instances) else False
 
+        last_completed_local_time = self._checkpoint_local_time
         for local_time in range(self._checkpoint_local_time, max_local_time + local_step_increment, local_step_increment):
             global_time = local_time * global_step_scale
             if global_time > self.cfg.num_env_steps:
@@ -769,7 +801,12 @@ class Workspace:
                             :, -1
                         ].clone()
 
-                context = self.agent.maybe_update_rollout_context(z=context, step_count=step_count, replay_buffer=replay_buffer)
+                context_kwargs = {}
+                if getattr(train_env._env, "morphology_config", None):
+                    context_kwargs["morphology_delta_m"] = train_env._env.morphology_delta_m
+                context = self.agent.maybe_update_rollout_context(
+                    z=context, step_count=step_count, replay_buffer=replay_buffer, **context_kwargs
+                )
                 if local_time < self.cfg.num_seed_steps:
                     action = train_env.action_space.sample().astype(np.float32)
                 else:
@@ -921,9 +958,10 @@ class Workspace:
                     optimizer_steps=self._optimizer_steps,
                 )
             replay_buffer["train"].extend(data)
+            self._replay_warmup.advance(local_step_increment)
 
             update_dt = 0.0
-            if len(replay_buffer["train"]) > 0 and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
+            if len(replay_buffer["train"]) > 0 and self._replay_warmup.ready and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
                 update_agent_time_checker.update_last_step(local_time)
                 update_t0 = time.time()
                 for _ in range(self.cfg.num_agent_updates):
@@ -1022,7 +1060,17 @@ class Workspace:
             truncated = new_truncated
             done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
             info = new_info
+            last_completed_local_time = next_local_time
+        self._save_final_checkpoint(local_time=last_completed_local_time,
+                                    global_time=last_completed_local_time * global_step_scale,
+                                    replay_buffer=replay_buffer)
         train_env.close()
+
+    def _save_final_checkpoint(self, *, local_time: int, global_time: int, replay_buffer: Dict[str, tp.Any]) -> None:
+        position = (local_time, global_time, self._optimizer_steps)
+        if self.cfg.transactional_checkpoints and position != self._last_checkpoint_position:
+            self.save(local_time=local_time, global_time=global_time,
+                      optimizer_steps=self._optimizer_steps, replay_buffer=replay_buffer)
 
     def eval(self, t, replay_buffer):
         print(f"Starting evaluation at time {t}")
@@ -1070,7 +1118,22 @@ class Workspace:
         return evaluation_results
 
     def save(self, *, local_time: int, global_time: int, optimizer_steps: int, replay_buffer: Dict[str, tp.Any]) -> None:
+        if self.cfg.transactional_checkpoints:
+            status = _make_train_status(self.cfg, local_time=local_time, global_time=global_time, optimizer_steps=optimizer_steps)
+            status["checkpoint_format"] = "immutable_generation_v1"
+            status["replay_buffer_saved"] = self.cfg.checkpoint_buffer
+            warmup = getattr(self, "_replay_warmup", ReplayWarmup())
+            status["resume_replay_warmup"] = {"required_local_steps": warmup.required_steps, "collected_local_steps": warmup.collected_steps}
+            transactional_save(
+                self,
+                train_status=status,
+                replay_buffer=replay_buffer,
+            )
+            self._last_checkpoint_position = (local_time, global_time, optimizer_steps)
+            return
         checkpoint_dir = self.work_dir / CHECKPOINT_DIR_NAME
+        if (checkpoint_dir / "CURRENT").exists():
+            raise RuntimeError("Legacy CURRENT checkpoints are read-only here; use a new work_dir to avoid overwriting old generations")
         sync_report = None
         if self.cfg.distributed_sync:
             barrier()

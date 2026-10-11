@@ -156,6 +156,7 @@ class PolicyExporterLSTM(torch.nn.Module):
 
 
 def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, velocity_multiplier: float = 1.0) -> torch.Tensor:
+    from humanoidverse.utils.morphology import append_morphology_state
     from humanoidverse.utils.torch_utils import quat_rotate_inverse
     from humanoidverse.envs.motion_observations import compute_humanoid_observations_max, compute_humanoid_observations_max_with_contact
     
@@ -230,11 +231,24 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
             "last_action": last_action,
             "privileged_state": max_local_self_obs
         }
+        if getattr(env, "morphology_config", None):
+            delta = motion_state["morphology_delta_m"]
+            ref_dict["morphology_delta_m"] = delta
+            ref_dict["motion_ids"] = torch.as_tensor(motion_id, device=env.device, dtype=torch.long).expand_as(motion_times)
+            ref_dict["motion_start_times"] = motion_times
+            for key in ("state", "privileged_state"):
+                ufo_obs[key] = append_morphology_state(env, ufo_obs[key], delta)
         return ufo_obs, ref_dict
     else:
         ref_dict = {
             "max_local_self_obs": max_local_self_obs,
         }
+        if getattr(env, "morphology_config", None):
+            delta = motion_state["morphology_delta_m"]
+            ref_dict["morphology_delta_m"] = delta
+            ref_dict["motion_ids"] = torch.as_tensor(motion_id, device=env.device, dtype=torch.long).expand_as(motion_times)
+            ref_dict["motion_start_times"] = motion_times
+            max_local_self_obs = append_morphology_state(env, max_local_self_obs, delta)
         return max_local_self_obs, ref_dict
 
 

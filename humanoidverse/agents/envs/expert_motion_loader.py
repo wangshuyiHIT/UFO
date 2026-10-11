@@ -7,6 +7,7 @@ from humanoidverse.envs.env_utils.history_handler import HistoryHandler as HVHis
 from humanoidverse.envs.motion_observations import compute_humanoid_observations_max
 from humanoidverse.utils.torch_utils import quat_rotate_inverse
 from humanoidverse.utils.reference_observations import reference_base_ang_vel
+from humanoidverse.utils.morphology import append_morphology_state
 
 from ..buffers.trajectory import TrajectoryDictBuffer
 
@@ -55,6 +56,12 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             ],
             dim=-1,
         )
+        if getattr(env, "morphology_config", None):
+            # Expert tokens come from the actual retargeted motion, never from
+            # whichever morphology the online environment currently contains.
+            delta = motion_res["morphology_delta_m"]
+            state = append_morphology_state(env, state, delta)
+            max_local_self_obs = append_morphology_state(env, max_local_self_obs, delta)
 
         data = {
             "base_ang_vel": ref_ang_vel,
@@ -109,6 +116,8 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             "truncated": truncated,
             "motion_id": torch.ones(curr_motion_len, dtype=torch.long) * i,
         }
+        if getattr(env, "morphology_config", None):
+            ep["morphology_delta_m"] = motion_res["morphology_delta_m"]
         if add_history_noaction:
             ep["observation"]["history_noaction"] = history_actor
         episodes.append(ep)
