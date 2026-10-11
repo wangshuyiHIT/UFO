@@ -7,6 +7,7 @@ Defaults are kept in this file; command-line arguments can override them.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -135,6 +136,8 @@ def build_ufo_mjlab_config(
     checkpoint_timeout_seconds: float = 300.0,
     eval_every_steps: int | None = None,
     compile_agent: bool | None = None,
+    warm_start: dict | None = None,
+    training_data_provenance: dict | None = None,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
     robot_training = load_robot_training_spec(robot_config or DEFAULT_ROBOT_CONFIG)
@@ -264,6 +267,8 @@ def build_ufo_mjlab_config(
         transactional_checkpoints=transactional_checkpoints,
         checkpoint_reserve_gib=checkpoint_reserve_gib,
         checkpoint_timeout_seconds=checkpoint_timeout_seconds,
+        warm_start=warm_start,
+        training_data_provenance=training_data_provenance,
         prioritization=run_eval_and_prioritization,
         prioritization_min_val=0.5,
         prioritization_max_val=2.0,
@@ -371,6 +376,13 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         checkpoint_timeout_seconds=args.checkpoint_timeout_seconds,
         eval_every_steps=args.eval_every_steps,
         compile_agent=args.compile,
+        warm_start=({"generation": str(args.warm_start_generation.absolute()),
+                     "manifest_sha256": args.warm_start_manifest_sha256,
+                     "model_sha256": args.warm_start_model_sha256,
+                     **({"launch_receipt": str(args.warm_start_launch_receipt.absolute()),
+                         "launch_receipt_sha256": args.warm_start_launch_receipt_sha256}
+                        if args.warm_start_launch_receipt else {})} if args.warm_start_generation else None),
+        training_data_provenance=(json.loads(args.training_data_provenance_json) if args.training_data_provenance_json else None),
     )
     print(
         "[INFO] UFO train: "
@@ -462,6 +474,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-ids", default="single", help="'single', 'all', or a comma-separated GPU id list relative to CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--work-dir", default=DEFAULT_WORK_DIR)
+    parser.add_argument("--warm-start-generation", type=Path)
+    parser.add_argument("--warm-start-manifest-sha256")
+    parser.add_argument("--warm-start-model-sha256")
+    parser.add_argument("--warm-start-launch-receipt", type=Path)
+    parser.add_argument("--warm-start-launch-receipt-sha256")
+    parser.add_argument("--training-data-provenance-json", help="Exact qualified bank identities from the outer launcher")
     parser.add_argument(
         "--robot-config",
         type=Path,
@@ -552,6 +570,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--smoke", action="store_true", help="Short local smoke settings: 16 envs, 2048 env steps, no W&B.")
     args = parser.parse_args()
+    if any((args.warm_start_generation, args.warm_start_manifest_sha256, args.warm_start_model_sha256)) and not all((args.warm_start_generation, args.warm_start_manifest_sha256, args.warm_start_model_sha256)):
+        parser.error("Warm-start requires generation, COMMITTED SHA256 and model SHA256 together")
+    if any((args.warm_start_launch_receipt, args.warm_start_launch_receipt_sha256)) and not all((args.warm_start_generation, args.warm_start_launch_receipt, args.warm_start_launch_receipt_sha256)):
+        parser.error("Warm-start launch receipt requires its SHA256 and a pinned generation")
     raw_agent = args.agent
     args.agent = canonical_agent_name(args.agent)
     if raw_agent == "tldr":

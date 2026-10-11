@@ -30,6 +30,15 @@ def profile():
 
 
 class MorphologyTest(unittest.TestCase):
+    def test_synthetic_static_is_explicit_and_not_human_retargeting(self):
+        metadata = dict(morphology_delta_m=[0]*5, morphology_reference="synthetic_static",
+                        source_kind="synthetic_constant", reference_kind="synthetic_static", synthetic=True)
+        np.testing.assert_array_equal(motion_morphology_delta({"metadata":metadata}, config()), np.zeros(5))
+        for field in ('source_kind','reference_kind','synthetic'):
+            bad={k:v for k,v in metadata.items() if k!=field}
+            with self.assertRaisesRegex(ValueError,'explicit'):
+                motion_morphology_delta({'metadata':bad},config())
+
     def test_requires_retargeted_finite_bounded_metadata(self):
         cfg = validate_morphology_config(config())
         motion = {"metadata": {"morphology_delta_m": [.03, 0, 0, 0, 0], "morphology_reference": "retargeted"}}

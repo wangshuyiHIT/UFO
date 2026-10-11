@@ -45,6 +45,8 @@ class TrajectoryDictBuffer:
         output_key_tp1: List[str] = ["observation"],
         end_key: Tuple[str] | str = "done",
         motion_id_key: Tuple[str] | str = "motion_id",
+        trajectory_source_labels: List[str] | None = None,
+        source_weights: Dict[str, float] | None = None,
     ) -> None:
         self._is_full = True
         self.output_key_t = output_key_t
@@ -96,6 +98,21 @@ class TrajectoryDictBuffer:
         )
         # set priorities to match the number of trajectories
         self.priorities = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32) / len(self.lengths)
+        self.source_weights = source_weights
+        self.trajectory_source_ids = None
+        if (trajectory_source_labels is None) != (source_weights is None):
+            raise ValueError("Expert source labels and weights must be supplied together")
+        if source_weights is not None:
+            if (len(trajectory_source_labels) != len(self.lengths) or not source_weights or
+                    set(trajectory_source_labels) != set(source_weights) or
+                    any(not isinstance(k, str) or not k for k in source_weights) or
+                    any(not np.isfinite(v) or v <= 0 for v in source_weights.values())):
+                raise ValueError("Expert sources require one known label per trajectory and positive finite weights")
+            self.source_names = list(source_weights)
+            self.trajectory_source_ids = torch.tensor([self.source_names.index(k) for k in trajectory_source_labels], device=device)
+            self._source_weights = torch.tensor(list(source_weights.values()), device=device, dtype=torch.float32)
+            self._raw_priorities = torch.ones_like(self.priorities)
+            self.priorities = self._source_priorities(torch.ones_like(self.lengths, dtype=torch.bool))
         self.trajectory_morphology_delta_m = None
         if "morphology_delta_m" in self.storage:
             delta = self.storage["morphology_delta_m"]
@@ -132,7 +149,7 @@ class TrajectoryDictBuffer:
                 lengths=self.lengths[traj_idx],
                 start_idx=self.start_idx[traj_idx],
                 storage_length=self.capacity,
-                priorities=self.priorities[traj_idx],
+                priorities=self._source_priorities(traj_idx) if self.source_weights is not None else self.priorities[traj_idx],
             )
         else:
             if self.trajectory_morphology_delta_m is None:
@@ -147,7 +164,7 @@ class TrajectoryDictBuffer:
                 if not bool(eligible.any()):
                     raise ValueError(f"No expert trajectory of morphology {shape.tolist()} is long enough for {seq_length} steps")
                 slices = (assignment == shape_id).nonzero(as_tuple=False).flatten()
-                priorities = self.priorities[eligible]
+                priorities = self._source_priorities(eligible) if self.source_weights is not None else self.priorities[eligible]
                 if float(priorities.sum()) <= 0:
                     priorities = torch.ones_like(priorities)
                 # The matched path has a small bank of shapes. Avoid compiling a
@@ -168,8 +185,38 @@ class TrajectoryDictBuffer:
     def update_priorities(self, priorities: torch.Tensor, idxs: torch.Tensor) -> None:
         """update priorities of trajectories"""
         assert len(priorities) == len(self.priorities)
+        if self.source_weights is not None:
+            priorities = priorities.to(device=self.device, dtype=self.priorities.dtype)
+            idxs = torch.as_tensor(idxs, device=self.device, dtype=torch.long)
+            if (len(idxs) != len(self.priorities) or len(torch.unique(idxs)) != len(idxs) or
+                    bool((idxs < 0).any()) or bool((idxs >= len(self.priorities)).any()) or
+                    not bool(torch.isfinite(priorities).all()) or bool((priorities < 0).any())):
+                raise ValueError("Invalid expert source priorities or trajectory indices")
+            self._raw_priorities[idxs] = priorities
+            self.priorities = self._source_priorities(torch.ones_like(self.lengths, dtype=torch.bool))
+            return
         self.priorities[idxs] = priorities
         self.priorities = self.priorities / torch.sum(self.priorities)
+
+    def _source_priorities(self, eligible):
+        """Preserve bank mass; absent banks are excluded for conditional queries.
+
+        A zero-priority bank falls back to uniform within that bank, matching
+        MotionLib. Sampling remains stochastic, not an exact per-batch quota.
+        """
+        ids, raw = self.trajectory_source_ids[eligible], self._raw_priorities[eligible]
+        result = torch.zeros_like(raw)
+        for source_id, weight in enumerate(self._source_weights):
+            mask = ids == source_id
+            if not bool(mask.any()):
+                continue
+            values = raw[mask]
+            if float(values.sum()) <= 0:
+                values = torch.ones_like(values)
+            result[mask] = weight * values / values.sum()
+        if float(result.sum()) <= 0:
+            raise ValueError("No eligible expert trajectory in any configured source")
+        return result / result.sum()
 
     @property
     def capacity(self):

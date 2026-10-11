@@ -123,6 +123,9 @@ class TrainConfig(BaseConfig):
     transactional_checkpoints: bool = False
     checkpoint_reserve_gib: float = pydantic.Field(default=4.0, ge=0, allow_inf_nan=False)
     checkpoint_timeout_seconds: float = pydantic.Field(default=300.0, gt=0, allow_inf_nan=False)
+    warm_start: dict | None = None
+    initialization_provenance: dict | None = None
+    training_data_provenance: dict | None = None
     prioritization: bool = False
     prioritization_min_val: float = 0.5
     prioritization_max_val: float = 5
@@ -210,11 +213,13 @@ class TrainConfig(BaseConfig):
         return Workspace(self)
 
 
-def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_build_kwargs: dict[str, tp.Any]):
+def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_build_kwargs: dict[str, tp.Any], *, warm_start_source=None):
     checkpoint_dir = resolve_checkpoint(work_dir, transactional=cfg.transactional_checkpoints)
     train_status_path = checkpoint_dir / "train_status.json"
     checkpoint_status = _initial_train_status(cfg)
     if train_status_path.exists():
+        if cfg.warm_start is not None:
+            raise ValueError("Warm-start cannot replace an existing checkpoint; use normal resume")
         with train_status_path.open("r") as f:
             train_status = json.load(f)
         checkpoint_status = _normalize_train_status(train_status, cfg)
@@ -224,8 +229,18 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
             f"global_time={checkpoint_status['global_time']} optimizer_steps={checkpoint_status['optimizer_steps']}"
         )
         agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device)
+        effective = checkpoint_dir / "effective_train_config.json"
+        if effective.exists():
+            cfg = cfg.model_copy(update={"initialization_provenance": json.loads(effective.read_text()).get("initialization_provenance")})
     else:
         agent = cfg.agent.build(**agent_build_kwargs)
+        if cfg.warm_start is not None:
+            from humanoidverse.training.warm_start import inspect_source, initialize_model
+            source = warm_start_source if warm_start_source is not None else inspect_source(cfg.warm_start)
+            provenance = initialize_model(agent, source, cfg.model_dump())
+            # Configs are immutable. Retain provenance but do not reapply the
+            # initializer when a later checkpoint is resumed normally.
+            cfg = cfg.model_copy(update={"initialization_provenance": provenance, "warm_start": None})
     return agent, cfg, checkpoint_status
 
 
@@ -435,6 +450,19 @@ class Workspace:
                 "resume preflight", lambda: str(resolve_checkpoint(Path(cfg.work_dir), transactional=True))
             )
 
+        self._warm_start_source = None
+        if cfg.warm_start is not None:
+            from humanoidverse.training.warm_start import assert_fresh_target, inspect_source, validate_interface
+            def inspect_initialization():
+                if self.distributed_rank != 0:
+                    return None
+                assert_fresh_target(Path(cfg.work_dir))
+                source = inspect_source(cfg.warm_start)
+                validate_interface(source, cfg.model_dump())
+                return source
+            self._warm_start_source = (self._checkpoint_coordinator.stage("warm-start preflight", inspect_initialization)[0]
+                                       if self._checkpoint_coordinator is not None else inspect_initialization())
+
         self._training_progress = None
         if self.distributed_rank == 0:
             # Publish a fresh run before expensive physics/model initialization.
@@ -482,8 +510,11 @@ class Workspace:
         set_seed_everywhere(self.cfg.seed)
 
         self.agent, self.cfg, self._checkpoint_status = create_agent_or_load_checkpoint(
-            self.work_dir, self.cfg, agent_build_kwargs=dict(obs_space=self.obs_space, action_dim=self.action_dim)
+            self.work_dir, self.cfg, agent_build_kwargs=dict(obs_space=self.obs_space, action_dim=self.action_dim),
+            warm_start_source=self._warm_start_source,
         )
+        if self._write_shared_artifacts and self._warm_start_source is not None:
+            (self.work_dir / "warm_start_receipt.json").write_text(json.dumps(self.cfg.initialization_provenance, indent=2) + "\n")
         self._checkpoint_local_time = int(self._checkpoint_status["local_time"])
         self._checkpoint_global_time = int(self._checkpoint_status["global_time"])
         self._optimizer_steps = int(self._checkpoint_status["optimizer_steps"])
@@ -609,7 +640,8 @@ class Workspace:
     def train_online(self) -> None:
         if self.training_with_expert_data:
             if self.cfg.load_expert_data_from_motion_lib:
-                expert_buffer = load_expert_trajectories_from_motion_lib(self.train_env._env, self.cfg.agent, device=self.cfg.buffer_device)
+                expert_buffer = load_expert_trajectories_from_motion_lib(self.train_env._env, self.cfg.agent, device=self.cfg.buffer_device,
+                                                                       data_provenance=self.cfg.training_data_provenance)
             else:
                 raise RuntimeError(
                     "This MJLab-focused build only supports expert data loaded from the motion library. "

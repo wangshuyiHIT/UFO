@@ -12,7 +12,7 @@ from humanoidverse.utils.morphology import append_morphology_state
 from ..buffers.trajectory import TrajectoryDictBuffer
 
 
-def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_history_noaction: bool = False):
+def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_history_noaction: bool = False, data_provenance=None):
     """Load expert trajectories directly from an environment motion library."""
     env._motion_lib.load_motions_for_training()
     episodes = []
@@ -122,10 +122,22 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             ep["observation"]["history_noaction"] = history_actor
         episodes.append(ep)
 
+    source_options = {}
+    if data_provenance is not None:
+        banks = data_provenance["banks"]
+        labels = [bank["name"] for bank in banks]
+        if len(labels) != len(set(labels)) or len(labels) != len(env._motion_lib._motion_source_weights):
+            raise ValueError("Expert bank labels do not match configured motion sources")
+        weights = torch.as_tensor([bank["weight"] for bank in banks], device=env.device)
+        if not torch.allclose(weights / weights.sum(), env._motion_lib._motion_source_weights, atol=1e-7, rtol=0):
+            raise ValueError("Expert and online bank weights disagree")
+        source_options = {"source_weights": dict(zip(labels, weights.cpu().tolist())),
+                          "trajectory_source_labels": [labels[int(i)] for i in env._motion_lib._motion_source_ids.cpu()]}
     expert_buffer = TrajectoryDictBuffer(
         episodes=episodes,
         seq_length=agent_cfg.model.seq_length,
         device=device,
+        **source_options,
     )
 
     assert expert_buffer.storage["observation"]["state"].shape[0] == expert_buffer.storage["truncated"].shape[0]

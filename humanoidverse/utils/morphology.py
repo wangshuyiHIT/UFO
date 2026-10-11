@@ -47,7 +47,15 @@ def motion_morphology_delta(motion: dict, cfg: dict) -> np.ndarray:
         raise ValueError("Every morphology motion requires finite metadata.morphology_delta_m")
     if np.any(delta < bounds[:, 0] - 1e-7) or np.any(delta > bounds[:, 1] + 1e-7):
         raise ValueError(f"Motion morphology exceeds physical family bounds: {delta.tolist()}")
-    if metadata.get("morphology_reference") != "retargeted":
+    reference = metadata.get("morphology_reference")
+    if reference == "synthetic_static":
+        # This declares how the pose was constructed, not training eligibility.
+        # FK is also used while qualifying a candidate; the formal launcher
+        # separately requires completed geometry/FK/temporal train qualification.
+        if (metadata.get("source_kind") != "synthetic_constant" or
+                metadata.get("reference_kind") != "synthetic_static" or metadata.get("synthetic") is not True):
+            raise ValueError("Synthetic morphology requires explicit constant/static/synthetic provenance")
+    elif reference != "retargeted":
         raise ValueError("Morphology motion requires metadata.morphology_reference=retargeted; a token alone is not retargeting")
     return delta
 
