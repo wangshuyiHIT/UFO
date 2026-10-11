@@ -380,27 +380,26 @@ def quat_to_angle_axis(q: Tensor, w_last: bool) -> Tuple[Tensor, Tensor]:
 
 @torch.jit.script
 def slerp(q0, q1, t):
-    """Spherical linear interpolation between two quaternions."""
-    cos_half_theta = torch.sum(q0 * q1, dim=-1)
+    """Shortest-arc quaternion interpolation, including accurate endpoints.
 
-    neg_mask = cos_half_theta < 0
-    q1 = q1.clone()
-    q1[neg_mask] = -q1[neg_mask]
-    cos_half_theta = torch.abs(cos_half_theta)
-    cos_half_theta = torch.unsqueeze(cos_half_theta, dim=-1)
+    FK matrix conversion can leave quaternion norms a few float32 ULPs from
+    one. Normalize before the dot product and use t-weighted nlerp near zero
+    angle; a fixed midpoint there changes even exact source-frame resets.
+    """
+    q0 = normalize(q0)
+    q1 = normalize(q1)
+    dot = torch.sum(q0 * q1, dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0, -q1, q1)
+    dot = torch.abs(dot).clamp(max=1.0)
+    near = dot > 0.9995
 
-    half_theta = torch.acos(cos_half_theta)
-    sin_half_theta = torch.sqrt(1.0 - cos_half_theta * cos_half_theta)
-
-    ratioA = torch.sin((1 - t) * half_theta) / sin_half_theta
-    ratioB = torch.sin(t * half_theta) / sin_half_theta
-
-    new_q = ratioA * q0 + ratioB * q1
-
-    new_q = torch.where(torch.abs(sin_half_theta) < 0.001, 0.5 * q0 + 0.5 * q1, new_q)
-    new_q = torch.where(torch.abs(cos_half_theta) >= 1, q0, new_q)
-
-    return new_q
+    # Keep the unused spherical branch finite at coincident endpoints too.
+    half_theta = torch.acos(dot.clamp(max=1.0 - 1e-7))
+    sin_half_theta = torch.sin(half_theta)
+    spherical = (torch.sin((1.0 - t) * half_theta) * q0
+                 + torch.sin(t * half_theta) * q1) / sin_half_theta
+    linear = (1.0 - t) * q0 + t * q1
+    return normalize(torch.where(near, linear, spherical))
 
 @torch.jit.script
 def angle_axis_to_exp_map(angle, axis):
