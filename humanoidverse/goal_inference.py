@@ -268,6 +268,7 @@ def run_goal_inference(
             camera_azimuth=camera_azimuth,
             camera_elevation=camera_elevation,
             expected_qpos_size=7 + num_dof,
+            morphology=getattr(env, "morphology_config", None),
         )
         try:
             first_motion_id = int(first_goal["motion_id"])

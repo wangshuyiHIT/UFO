@@ -234,6 +234,7 @@ def run_tracking_inference(
             camera_azimuth=camera_azimuth,
             camera_elevation=camera_elevation,
             expected_qpos_size=7 + num_dof,
+            morphology=getattr(env, "morphology_config", None),
         )
         if save_mp4
         else None
@@ -269,6 +270,8 @@ def run_tracking_inference(
                         expert_renderer,
                         use_env_render=use_env_render,
                     )
+                    if getattr(env, "morphology_config", None):
+                        expert_renderer.set_morphology(obs_dict["morphology_delta_m"][0])
                     expert_frame = expert_renderer.render_qpos(expert_qpos[min(step + 1, len(expert_qpos) - 1)])
                     expert_frame = _resize_nearest(expert_frame, policy_frame.shape[0], policy_frame.shape[1])
                     frames.append(np.concatenate([expert_frame, policy_frame], axis=1))

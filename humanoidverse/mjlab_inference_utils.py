@@ -8,6 +8,7 @@ qpos rendering used by tracking, goal and reward inference scripts.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -433,6 +434,7 @@ class MujocoQposRenderer:
         camera_azimuth: float = 135.0,
         camera_elevation: float = -18.0,
         expected_qpos_size: int | None = None,
+        morphology: dict | None = None,
     ):
         spec = mujoco.MjSpec.from_file(str(xml_path))
         spec.worldbody.add_geom(
@@ -453,6 +455,10 @@ class MujocoQposRenderer:
             specular=[0.1, 0.1, 0.1],
         )
         self.model = spec.compile()
+        from humanoidverse.utils.morphology import validate_morphology_config
+        self.morphology_config = validate_morphology_config(morphology)
+        self._nominal_model = copy.copy(self.model) if self.morphology_config else None
+        self._morphology_delta_m = None
         self.model.vis.global_.offwidth = max(int(self.model.vis.global_.offwidth), int(render_size))
         self.model.vis.global_.offheight = max(int(self.model.vis.global_.offheight), int(render_size))
         self.data = mujoco.MjData(self.model)
@@ -464,6 +470,30 @@ class MujocoQposRenderer:
         self.camera.elevation = float(camera_elevation)
         if expected_qpos_size is not None and self.model.nq != int(expected_qpos_size):
             raise ValueError(f"Expected renderer nq={expected_qpos_size}, got nq={self.model.nq}")
+
+    def set_morphology(self, delta_m) -> None:
+        """Apply actual dimensions from an immutable nominal render model."""
+        from humanoidverse.utils.morphology import morphology_model_parameters
+        if self.morphology_config is None:
+            raise ValueError("Renderer needs explicit morphology metadata before applying dimensions")
+        if isinstance(delta_m, torch.Tensor):
+            delta_m = delta_m.detach().cpu().numpy()
+        delta = np.asarray(delta_m, dtype=np.float32)
+        if self._morphology_delta_m is not None and np.array_equal(delta, self._morphology_delta_m):
+            return
+        fields = morphology_model_parameters(self._nominal_model, self.morphology_config, delta)
+        for name, value in fields.items():
+            destination = getattr(self.model, name)
+            destination[:] = value.reshape(destination.shape)
+        # Compile-time sameframe shortcuts may become invalid when dimensions
+        # change. Match the full transform path used by MuJoCo Warp.
+        none = mujoco.mjtSameFrame.mjSAMEFRAME_NONE.value
+        self.model.body_sameframe[:] = none
+        self.model.geom_sameframe[:] = none
+        self.model.site_sameframe[:] = none
+        self.model.body_simple[:] = 0
+        mujoco.mj_setConst(self.model, self.data)
+        self._morphology_delta_m = delta.copy()
 
     def render_qpos(self, qpos: np.ndarray) -> np.ndarray:
         qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
@@ -480,7 +510,8 @@ class MujocoQposRenderer:
         self.renderer.close()
 
 
-def policy_qpos_from_env(wrapped_env: Any, *, expected_qpos_size: int) -> np.ndarray:
+def policy_qpos_from_env(wrapped_env: Any, *, expected_qpos_size: int,
+                         model: mujoco.MjModel | None = None) -> np.ndarray:
     qpos, _qvel = wrapped_env._get_qpos_qvel(to_numpy=True)
     qpos = np.asarray(qpos)
     if qpos.ndim == 2:
@@ -488,6 +519,23 @@ def policy_qpos_from_env(wrapped_env: Any, *, expected_qpos_size: int) -> np.nda
     qpos = qpos.reshape(-1)
     if qpos.size != int(expected_qpos_size):
         raise ValueError(f"Expected MJLab policy qpos size {expected_qpos_size}, got shape {qpos.shape}")
+    if model is not None:
+        # _get_qpos_qvel returns controlled joints in policy order, whereas
+        # MuJoCo requires XML qpos order (different for Scaler and X2).
+        names = list(wrapped_env._env.dof_names)
+        if len(names) + 7 != model.nq or len(set(names)) != len(names):
+            raise ValueError("Policy renderer expects a free root and uniquely named scalar control joints")
+        addresses = []
+        for name in names:
+            joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if joint < 0 or model.jnt_type[joint] not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
+                raise ValueError(f"Missing or nonscalar policy render joint: {name}")
+            addresses.append(int(model.jnt_qposadr[joint]))
+        if sorted(addresses) != list(range(7, model.nq)):
+            raise ValueError("Policy render joint addresses do not cover qpos after the free root")
+        ordered = qpos.copy()
+        ordered[addresses] = qpos[7:]
+        qpos = ordered
     return qpos
 
 
@@ -497,6 +545,9 @@ def render_policy_frame(
     *,
     use_env_render: bool,
 ) -> tuple[np.ndarray, bool]:
+    core = wrapped_env._env
+    if getattr(core, "morphology_config", None):
+        renderer.set_morphology(core.morphology_delta_m[0])
     if use_env_render:
         try:
             return to_rgb_uint8(wrapped_env.render()), True
@@ -505,4 +556,5 @@ def render_policy_frame(
                 "[INFO] wrapped_env.render() did not return an RGB frame; "
                 f"falling back to MJLab qpos rendering for policy frames ({exc})."
             )
-    return renderer.render_qpos(policy_qpos_from_env(wrapped_env, expected_qpos_size=renderer.model.nq)), False
+    return renderer.render_qpos(policy_qpos_from_env(
+        wrapped_env, expected_qpos_size=renderer.model.nq, model=renderer.model)), False

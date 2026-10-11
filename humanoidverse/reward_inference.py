@@ -311,6 +311,7 @@ def run_reward_inference(
                 camera_azimuth=camera_azimuth,
                 camera_elevation=camera_elevation,
                 expected_qpos_size=7 + num_dof,
+                morphology=getattr(wrapped_env._env, "morphology_config", None),
             )
         for task in tasks:
             frames = []
