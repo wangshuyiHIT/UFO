@@ -45,6 +45,7 @@ from humanoidverse.agents.tldr_dist_aux.agent import TldrDistAuxAgentConfig
 from humanoidverse.agents.utils import EveryNStepsChecker, get_local_workdir, set_seed_everywhere
 from humanoidverse.distributed import average_metrics, barrier, broadcast_agent_state, broadcast_object, module_sync_report, sync_floating_buffers
 from humanoidverse.training.checkpoint_io import CheckpointCoordinator, ReplayWarmup, resolve_checkpoint, transactional_save
+from humanoidverse.training.progress import TrainingProgress, progress_phase
 
 TRAIN_LOG_FILENAME = "train_log.txt"
 REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
@@ -434,6 +435,20 @@ class Workspace:
                 "resume preflight", lambda: str(resolve_checkpoint(Path(cfg.work_dir), transactional=True))
             )
 
+        self._training_progress = None
+        if self.distributed_rank == 0:
+            # Publish a fresh run before expensive physics/model initialization.
+            # Use saved counters, never zero or the previous process's unsaved
+            # high-water mark, when continuing from a checkpoint.
+            checkpoint_dir = resolve_checkpoint(Path(cfg.work_dir), transactional=cfg.transactional_checkpoints)
+            status_path = checkpoint_dir / "train_status.json"
+            status = (_normalize_train_status(json.loads(status_path.read_text()), cfg)
+                      if status_path.exists() else _initial_train_status(cfg))
+            self._training_progress = TrainingProgress(
+                Path(cfg.work_dir) / "training_progress.json",
+                global_time=int(status["global_time"]), optimizer_steps=int(status["optimizer_steps"]),
+            )
+
         # MJLab environments are created once and shared with evaluation.
         if isinstance(cfg.env, HumanoidVerseMjlabConfig):
             from omegaconf import OmegaConf
@@ -514,7 +529,27 @@ class Workspace:
 
     def train(self):
         self.start_time = time.time()
-        self.train_online()
+        try:
+            self.train_online()
+        except BaseException:
+            reporter = getattr(self, "_training_progress", None)
+            if reporter is not None:
+                try:
+                    reporter.update(phase="failed", optimizer_steps=self._optimizer_steps, force=True)
+                except Exception as exc:
+                    warnings.warn(f"Training failed and its numeric progress receipt could not be updated: {exc}")
+            raise
+        else:
+            reporter = getattr(self, "_training_progress", None)
+            if reporter is not None:
+                reporter.update(phase="finished", optimizer_steps=self._optimizer_steps, force=True)
+
+    def _publish_training_progress(self, *, local_time: int, global_time: int) -> None:
+        reporter = getattr(self, "_training_progress", None)
+        if reporter is not None:
+            phase = ("warmup" if local_time < self.cfg.num_seed_steps or not self._replay_warmup.ready
+                     else "training")
+            reporter.update(global_time=int(global_time), optimizer_steps=int(self._optimizer_steps), phase=phase)
 
     def _get_torso_contact_force_metrics(self, train_env) -> dict[str, float]:
         if not self.cfg.log_torso_contact_forces:
@@ -624,6 +659,7 @@ class Workspace:
         )
         if self._replay_warmup.required_steps and self._write_shared_artifacts:
             print(f"[checkpoint] Replay was not restored; collect {self._replay_warmup.required_steps} new local environment steps before optimizer updates (saved counters retained)", flush=True)
+        self._publish_training_progress(local_time=self._checkpoint_local_time, global_time=self._checkpoint_global_time)
         if self.training_with_expert_data:
             replay_buffer["expert_slicer"] = expert_buffer
 
@@ -959,6 +995,7 @@ class Workspace:
                 )
             replay_buffer["train"].extend(data)
             self._replay_warmup.advance(local_step_increment)
+            self._publish_training_progress(local_time=next_local_time, global_time=next_global_time)
 
             update_dt = 0.0
             if len(replay_buffer["train"]) > 0 and self._replay_warmup.ready and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
@@ -996,6 +1033,7 @@ class Workspace:
                         metric_update_counts,
                         metrics,
                     )
+                    self._publish_training_progress(local_time=next_local_time, global_time=next_global_time)
                 update_dt = time.time() - update_t0
 
             if log_time_checker.check(global_time) and total_metrics is not None:
@@ -1073,6 +1111,11 @@ class Workspace:
                       optimizer_steps=self._optimizer_steps, replay_buffer=replay_buffer)
 
     def eval(self, t, replay_buffer):
+        with progress_phase(getattr(self, "_training_progress", None), "evaluation",
+                            global_time=int(t), optimizer_steps=int(self._optimizer_steps)):
+            return Workspace._run_evaluation(self, t, replay_buffer)
+
+    def _run_evaluation(self, t, replay_buffer):
         print(f"Starting evaluation at time {t}")
         evaluation_results = {}
 
@@ -1118,6 +1161,12 @@ class Workspace:
         return evaluation_results
 
     def save(self, *, local_time: int, global_time: int, optimizer_steps: int, replay_buffer: Dict[str, tp.Any]) -> None:
+        with progress_phase(getattr(self, "_training_progress", None), "checkpoint",
+                            global_time=int(global_time), optimizer_steps=int(optimizer_steps)):
+            return Workspace._save_checkpoint(self, local_time=local_time, global_time=global_time,
+                                              optimizer_steps=optimizer_steps, replay_buffer=replay_buffer)
+
+    def _save_checkpoint(self, *, local_time: int, global_time: int, optimizer_steps: int, replay_buffer: Dict[str, tp.Any]) -> None:
         if self.cfg.transactional_checkpoints:
             status = _make_train_status(self.cfg, local_time=local_time, global_time=global_time, optimizer_steps=optimizer_steps)
             status["checkpoint_format"] = "immutable_generation_v1"
