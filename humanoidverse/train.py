@@ -127,6 +127,7 @@ def build_ufo_mjlab_config(
     clip_grad_norm: float = 0.0,
     cartwheel_aux_safe: bool = False,
     num_agent_updates: int | None = None,
+    num_seed_steps: int | None = None,
     batch_size: int | None = None,
     rollout_expert_trajectories_length: int | None = None,
     robot_config: str | Path | None = None,
@@ -199,6 +200,10 @@ def build_ufo_mjlab_config(
     wandb_group = selected["wandb_group"]
     wandb_project = selected["wandb_project"]
     train_runtime = dict(selected["train_runtime"])
+    if num_seed_steps is not None:
+        if type(num_seed_steps) is not int or num_seed_steps <= 0:
+            raise ValueError("num_seed_steps must be a positive integer")
+        train_runtime["num_seed_steps"] = num_seed_steps
     if checkpoint_buffer is not None:
         train_runtime["checkpoint_buffer"] = bool(checkpoint_buffer)
     if eval_every_steps is not None:
@@ -367,6 +372,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         clip_grad_norm=args.clip_grad_norm,
         cartwheel_aux_safe=bool(args.cartwheel_aux_safe),
         num_agent_updates=args.num_agent_updates,
+        num_seed_steps=args.num_seed_steps,
         batch_size=args.batch_size,
         rollout_expert_trajectories_length=args.rollout_expert_trajectories_length,
         robot_config=args.robot_config,
@@ -491,6 +497,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     parser.add_argument("--num-env-steps", type=int, default=DEFAULT_NUM_ENV_STEPS)
+    parser.add_argument("--num-seed-steps", type=int, default=None,
+                        help="Override per-rank replay warmup environment steps; omitted preserves the agent preset.")
     parser.add_argument("--checkpoint-every-steps", type=int, default=DEFAULT_CHECKPOINT_EVERY_STEPS)
     parser.add_argument("--checkpoint-buffer", action=argparse.BooleanOptionalAction, default=None,
                         help="Save replay buffers with checkpoints (preset default if omitted); disable on small cloud disks.")
@@ -617,6 +625,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--eval-every-steps must be positive")
     if args.num_agent_updates is not None and args.num_agent_updates <= 0:
         raise ValueError("--num-agent-updates must be positive")
+    if args.num_seed_steps is not None and args.num_seed_steps <= 0:
+        raise ValueError("--num-seed-steps must be a positive integer")
     if args.batch_size is not None and args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
     if args.rollout_expert_trajectories_length is not None and args.rollout_expert_trajectories_length <= 0:
