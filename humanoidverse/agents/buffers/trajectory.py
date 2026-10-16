@@ -47,12 +47,17 @@ class TrajectoryDictBuffer:
         motion_id_key: Tuple[str] | str = "motion_id",
         trajectory_source_labels: List[str] | None = None,
         source_weights: Dict[str, float] | None = None,
+        payload_device: str | None = None,
     ) -> None:
         self._is_full = True
         self.output_key_t = output_key_t
         self.output_key_tp1 = output_key_tp1
         self.seq_length = seq_length
         self.device = device
+        if payload_device not in (None, "cpu"):
+            raise ValueError("Only the explicit CPU payload residency mode is supported")
+        self.payload_device = payload_device
+        storage_device = device if payload_device is None else payload_device
         self.end_key = end_key
         self.motion_id_key = motion_id_key
 
@@ -66,7 +71,7 @@ class TrajectoryDictBuffer:
                 else:
                     if k not in storage:
                         storage[k] = []
-                    storage[k].append(_to_torch(v, device=self.device))
+                    storage[k].append(_to_torch(v, device=storage_device))
 
         def concat_dict(storage):
             for k, v in storage.items():
@@ -84,7 +89,7 @@ class TrajectoryDictBuffer:
             add_new_data(ep, self.storage)
             # add termination of each episode
             if not key_exists(ep, self.end_key):
-                episode_start = torch.zeros((ep[_k].shape[0], 1), dtype=torch.bool, device=self.device)
+                episode_start = torch.zeros((ep[_k].shape[0], 1), dtype=torch.bool, device=storage_device)
                 episode_start[-1] = True
                 get_key(self.storage, self.end_key).append(episode_start)
             self.motion_ids.append(get_key(ep, self.motion_id_key)[0].item())
@@ -92,6 +97,8 @@ class TrajectoryDictBuffer:
         concat_dict(self.storage)
         assert get_key(self.storage, self.end_key).dtype == torch.bool
         done = get_key(self.storage, self.end_key)
+        if self.payload_device is not None:
+            done = done.to(self.device)
         # cursor is none since we don't wrap data
         self.start_idx, self.stop_idx, self.lengths = find_start_stop_traj(
             done.squeeze()[: len(self)], at_capacity=self._is_full, cursor=None
@@ -116,6 +123,9 @@ class TrajectoryDictBuffer:
         self.trajectory_morphology_delta_m = None
         if "morphology_delta_m" in self.storage:
             delta = self.storage["morphology_delta_m"]
+            if self.payload_device is not None:
+                # Only small sampling metadata is copied; observation payload stays on CPU.
+                delta = delta.to(self.device)
             if delta.ndim != 2 or not bool(torch.isfinite(delta).all()):
                 raise ValueError("Expert morphology must be finite [frames, dimensions]")
             self.trajectory_morphology_delta_m = delta[self.start_idx[:, 0]].clone()
@@ -174,12 +184,14 @@ class TrajectoryDictBuffer:
                 rows = (slices[:, None] * seq_length + torch.arange(seq_length, device=self.device)).flatten()
                 idxs[rows] = selected
         idxs = idxs.to(torch.long).unbind(-1)
+        gather_idxs = tuple(i.cpu() for i in idxs) if self.payload_device is not None else idxs
         for k in self.output_key_t:
-            output[k] = tree_map(lambda x: x[idxs], self.storage[k])
+            output[k] = tree_map(lambda x: x[gather_idxs].to(self.device) if self.payload_device is not None else x[gather_idxs], self.storage[k])
         # increment the time index to get the next states
         idxs = ((idxs[0] + 1) % self.capacity, *idxs[1:])
+        gather_idxs = tuple(i.cpu() for i in idxs) if self.payload_device is not None else idxs
         for k in self.output_key_tp1:
-            output["next"][k] = tree_map(lambda x: x[idxs], self.storage[k])
+            output["next"][k] = tree_map(lambda x: x[gather_idxs].to(self.device) if self.payload_device is not None else x[gather_idxs], self.storage[k])
         return output
 
     def update_priorities(self, priorities: torch.Tensor, idxs: torch.Tensor) -> None:
@@ -273,6 +285,8 @@ class TrajectoryDictBufferMultiDim(DictBuffer):
 
         if self._recompute_start_stop:
             done = get_key(self.storage, self.end_key)
+            if self.payload_device is not None:
+                done = done.to(self.device)
             self.start_idx, self.stop_idx, self.lengths = find_start_stop_traj(
                 done.squeeze()[: len(self)], at_capacity=self._is_full, cursor=self._idx - 1
             )
@@ -295,19 +309,25 @@ class TrajectoryDictBufferMultiDim(DictBuffer):
             priorities=None,
         )
         idxs = idxs.to(torch.long).unbind(-1)
+        gather_idxs = tuple(i.cpu() for i in idxs) if self.payload_device is not None else idxs
         for k in self.output_key_t:
-            output[k] = tree_map(lambda x: x[idxs], self.storage[k])
+            output[k] = tree_map(lambda x: x[gather_idxs].to(self.device) if self.payload_device is not None else x[gather_idxs], self.storage[k])
         # increment the time index to get the next states
         idxs = ((idxs[0] + 1) % self.capacity, *idxs[1:])
+        gather_idxs = tuple(i.cpu() for i in idxs) if self.payload_device is not None else idxs
         for k in self.output_key_tp1:
-            output["next"][k] = tree_map(lambda x: x[idxs], self.storage[k])
+            output["next"][k] = tree_map(lambda x: x[gather_idxs].to(self.device) if self.payload_device is not None else x[gather_idxs], self.storage[k])
         return output
 
     def get_full_buffer(self) -> Dict:
         """We assume to return transition based"""
+        if self.payload_device is not None:
+            raise NotImplementedError("CPU payload full-buffer relabeling is not qualified")
 
         if self._recompute_start_stop:
             done = get_key(self.storage, self.end_key)
+            if self.payload_device is not None:
+                done = done.to(self.device)
             self.start_idx, self.stop_idx, self.lengths = find_start_stop_traj(
                 done.squeeze()[: len(self)], at_capacity=self._is_full, cursor=self._idx - 1
             )

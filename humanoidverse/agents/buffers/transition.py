@@ -49,6 +49,12 @@ class DictBuffer:
     capacity: int
     device: str = "cpu"
     nested_key_separator: str = "-"
+    payload_device: str | None = None
+
+    def _payload_device(self):
+        if self.payload_device not in (None, "cpu"):
+            raise ValueError("Only the explicit CPU payload residency mode is supported")
+        return self.device if self.payload_device is None else self.payload_device
 
     def __post_init__(self) -> None:
         self.storage = None
@@ -73,7 +79,7 @@ class DictBuffer:
             return
         if self.storage is None:
             self.storage = {}
-            initialize_storage(data, self.storage, self.capacity, self.device, n_dim=self._ndim())
+            initialize_storage(data, self.storage, self.capacity, self._payload_device(), n_dim=self._ndim())
             self._idx = 0
             self._is_full = False
             # let's store a key for easy inspection
@@ -96,16 +102,16 @@ class DictBuffer:
                         # Wrap data
                         diff = self.capacity - self._idx
                         # fill up to the end
-                        storage[k][self._idx :] = _to_torch(v[:diff], device=self.device)
+                        storage[k][self._idx :] = _to_torch(v[:diff], device=self._payload_device())
                         # handle the remaning data
                         if v[diff:].shape[0] > self.capacity:
                             raise ValueError(
                                 "The amount of data to put into buffer was way bigger than capacity. We do not currently handle this. Try extending in smaller batches / increase capacity."
                             )
-                        storage[k][: v.shape[0] - diff] = _to_torch(v[diff:], device=self.device)
+                        storage[k][: v.shape[0] - diff] = _to_torch(v[diff:], device=self._payload_device())
                         self._is_full = True
                     else:
-                        storage[k][self._idx : end] = _to_torch(v, device=self.device)
+                        storage[k][self._idx : end] = _to_torch(v, device=self._payload_device())
 
         data_dim = data[self._non_nested_key].shape[0]
         add_new_data(data, self.storage, expected_dim=data_dim)
@@ -123,6 +129,8 @@ class DictBuffer:
             return extract_values(self.storage, torch.arange(0, len(self)))
 
     def save(self, folder: str | Path, nested_key_separator: str | None = None) -> None:
+        if self.payload_device is not None:
+            raise NotImplementedError("CPU payload residency requires checkpoint_buffer=False")
         if not self.empty():
             nested_key_separator = self.nested_key_separator if nested_key_separator is None else nested_key_separator
             folder = Path(folder)
@@ -151,6 +159,8 @@ class DictBuffer:
                 json.dump(m_dict, f, indent=4)
 
     def load_hdf5(self, h5_file: str | Path, nested_key_separator: str | None = None) -> None:
+        if self.payload_device is not None:
+            raise NotImplementedError("CPU payload replay restore is not qualified")
         nested_key_separator = nested_key_separator or self.nested_key_separator
         hf = h5py.File(str(h5_file), "r")
         storage = {}

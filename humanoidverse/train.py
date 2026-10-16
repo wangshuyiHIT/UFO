@@ -128,6 +128,7 @@ def build_ufo_mjlab_config(
     cartwheel_aux_safe: bool = False,
     num_agent_updates: int | None = None,
     num_seed_steps: int | None = None,
+    cpu_payload_storage: bool = False,
     batch_size: int | None = None,
     rollout_expert_trajectories_length: int | None = None,
     robot_config: str | Path | None = None,
@@ -266,6 +267,7 @@ def build_ufo_mjlab_config(
         num_env_steps=num_env_steps,
         update_agent_every=train_runtime["update_agent_every"],
         num_seed_steps=train_runtime["num_seed_steps"],
+        cpu_payload_storage=cpu_payload_storage,
         num_agent_updates=train_runtime["num_agent_updates"],
         checkpoint_every_steps=checkpoint_every_steps,
         checkpoint_buffer=train_runtime["checkpoint_buffer"],
@@ -373,6 +375,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         cartwheel_aux_safe=bool(args.cartwheel_aux_safe),
         num_agent_updates=args.num_agent_updates,
         num_seed_steps=args.num_seed_steps,
+        cpu_payload_storage=args.cpu_payload_storage,
         batch_size=args.batch_size,
         rollout_expert_trajectories_length=args.rollout_expert_trajectories_length,
         robot_config=args.robot_config,
@@ -495,6 +498,7 @@ def parse_args() -> argparse.Namespace:
             "If omitted and --data-manifest declares robot_config, the manifest robot config is used."
         ),
     )
+    parser.add_argument("--cpu-payload-storage", action="store_true", help="Keep all replay/expert payload on CPU; sample on the original buffer device")
     parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     parser.add_argument("--num-env-steps", type=int, default=DEFAULT_NUM_ENV_STEPS)
     parser.add_argument("--num-seed-steps", type=int, default=None,

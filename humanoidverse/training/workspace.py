@@ -148,6 +148,7 @@ class TrainConfig(BaseConfig):
     # misc
     load_expert_data_from_motion_lib: bool = True
     buffer_device: str = "cpu"
+    cpu_payload_storage: bool = False
     # Default to True; otherwise you will spam the console with tqdm
     disable_tqdm: bool = True
     log_torso_contact_forces: bool = True
@@ -173,6 +174,8 @@ class TrainConfig(BaseConfig):
     infra: dict = pydantic.Field(default_factory=dict)
 
     def model_post_init(self, context):
+        if self.cpu_payload_storage and (not self.use_trajectory_buffer or self.checkpoint_buffer):
+            raise ValueError("CPU payload storage requires trajectory replay and checkpoint_buffer=False")
         if self.transactional_checkpoints and self.distributed_world_size > 1:
             if not self.distributed_sync or not self.rank0_only_writes:
                 raise ValueError("Transactional distributed checkpoints require distributed_sync and rank0_only_writes")
@@ -641,7 +644,8 @@ class Workspace:
         if self.training_with_expert_data:
             if self.cfg.load_expert_data_from_motion_lib:
                 expert_buffer = load_expert_trajectories_from_motion_lib(self.train_env._env, self.cfg.agent, device=self.cfg.buffer_device,
-                                                                       data_provenance=self.cfg.training_data_provenance)
+                                                                       data_provenance=self.cfg.training_data_provenance,
+                                                                       payload_device="cpu" if self.cfg.cpu_payload_storage else None)
             else:
                 raise RuntimeError(
                     "This MJLab-focused build only supports expert data loaded from the motion library. "
@@ -660,6 +664,8 @@ class Workspace:
         checkpoint_dir = resolve_checkpoint(self.work_dir, transactional=self.cfg.transactional_checkpoints)
         checkpoint_buffer_dir = self._checkpoint_buffer_path(checkpoint_dir)
         if checkpoint_buffer_dir.exists():
+            if self.cfg.cpu_payload_storage:
+                raise RuntimeError("CPU payload storage cannot silently consume a saved replay buffer")
             print("Loading checkpointed buffer")
             if self.cfg.use_trajectory_buffer:
                 replay_buffer["train"] = TrajectoryDictBufferMultiDim.load(checkpoint_buffer_dir, device=self.cfg.buffer_device)
@@ -671,6 +677,7 @@ class Workspace:
                 replay_buffer["train"] = TrajectoryDictBufferMultiDim(
                     capacity=self.cfg.buffer_size // self.cfg.online_parallel_envs,  # make sure to divide by num_envs
                     device=self.cfg.buffer_device,
+                    payload_device="cpu" if self.cfg.cpu_payload_storage else None,
                     n_dim=2,
                     end_key="truncated",
                     output_key_t=_trajectory_output_keys(self.cfg.agent),

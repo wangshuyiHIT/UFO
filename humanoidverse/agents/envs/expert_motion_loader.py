@@ -10,9 +10,10 @@ from humanoidverse.utils.reference_observations import reference_base_ang_vel
 from humanoidverse.utils.morphology import append_morphology_state
 
 from ..buffers.trajectory import TrajectoryDictBuffer
+from torch.utils._pytree import tree_map
 
 
-def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_history_noaction: bool = False, data_provenance=None):
+def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_history_noaction: bool = False, data_provenance=None, payload_device=None):
     """Load expert trajectories directly from an environment motion library."""
     env._motion_lib.load_motions_for_training()
     episodes = []
@@ -120,6 +121,12 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             ep["morphology_delta_m"] = motion_res["morphology_delta_m"]
         if add_history_noaction:
             ep["observation"]["history_noaction"] = history_actor
+        if payload_device is not None:
+            if payload_device != "cpu":
+                raise ValueError("Only CPU payload residency is supported")
+            # Preserve environment-device FK/observation math; release each motion
+            # payload from that device before constructing the next motion.
+            ep = tree_map(lambda value: value.detach().to("cpu"), ep)
         episodes.append(ep)
 
     source_options = {}
@@ -137,6 +144,7 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         episodes=episodes,
         seq_length=agent_cfg.model.seq_length,
         device=device,
+        payload_device=payload_device,
         **source_options,
     )
 
