@@ -453,10 +453,16 @@ class FBAgent:
         return z
 
     @classmethod
-    def load(cls, path: str, device: str | None = None):
+    def load(cls, path: str, device: str | None = None, *, obs_normalizer_policy=None):
         path = Path(path)
         with (path / "config.json").open() as f:
             loaded_config = json.load(f)
+        if obs_normalizer_policy is not None:
+            from humanoidverse.training.obs_normalizer_resume import checked_load_config
+            from humanoidverse.training.obs_normalizer_sync import file_stat
+            obs_source_stat = file_stat(path / "model/model.safetensors")
+            loaded_config, obs_policy_contract = checked_load_config(
+                path, loaded_config, obs_normalizer_policy, return_contract=True)
         if torch.cuda.is_available() and (device is None or str(device).startswith("cuda")):
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             torch.cuda.set_device(local_rank)
@@ -483,11 +489,23 @@ class FBAgent:
         config = cls.config_class(**loaded_config)
         agent = config.build(obs_space, action_dim)
         optimizers = torch.load(str(path / "optimizers.pth"), weights_only=True, map_location=map_device)
+        if obs_normalizer_policy is not None:
+            from humanoidverse.training.obs_normalizer_resume import OPTIMIZERS, need
+            need(set(optimizers) == OPTIMIZERS, "Saved optimizer closure differs")
         for k, v in optimizers.items():
             getattr(agent, k).load_state_dict(v)
+        if obs_normalizer_policy is not None:
+            from safetensors import safe_open
+            with safe_open(path / "model/model.safetensors", framework="pt", device="cpu") as saved:
+                need(set(saved.keys()) == set(agent._model.state_dict()), "Saved complete model state keys differ")
         safetensors.torch.load_model(agent._model, path / "model/model.safetensors", device=map_device, strict=False)
         agent._model.train()
         agent._model.requires_grad_(True)
+        if obs_normalizer_policy is not None:
+            from humanoidverse.training.obs_normalizer_sync import admit_restore
+            agent._obs_freeze_admission = admit_restore(
+                obs_policy_contract, obs_normalizer_policy["binding"],
+                obs_normalizer_policy["target_effective"], obs_source_stat)
         return agent
 
     def save(self, output_folder: str) -> None:

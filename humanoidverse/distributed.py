@@ -55,21 +55,41 @@ def average_gradients(parameters: Iterable[torch.nn.Parameter]) -> None:
 
 
 @torch.compiler.disable
-def broadcast_module_state(module: torch.nn.Module, src: int = 0) -> None:
-    if not is_distributed():
+def broadcast_module_state(module: torch.nn.Module, src: int = 0, *, obs_freeze_guard=None, coordinate=None) -> None:
+    if obs_freeze_guard is None:
+        if not is_distributed():
+            return
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            dist.broadcast(tensor.data, src=src)
         return
-    for tensor in list(module.parameters()) + list(module.buffers()):
-        dist.broadcast(tensor.data, src=src)
+    from humanoidverse.training.obs_normalizer_sync import require_guard
+    require_guard(obs_freeze_guard)
+    obs_freeze_guard.check("initial_broadcast_before", coordinate, module)
+    protected_ids = obs_freeze_guard.protected_ids(module, "initial_broadcast_before")
+    if is_distributed():
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            if id(tensor) not in protected_ids:
+                dist.broadcast(tensor.data, src=src)
+    obs_freeze_guard.check("initial_broadcast_after", coordinate, module)
 
 
 @torch.compiler.disable
-def sync_floating_buffers(module: torch.nn.Module, src: int = 0) -> None:
+def sync_floating_buffers(module: torch.nn.Module, src: int = 0, *, obs_freeze_guard=None, coordinate=None) -> None:
+    if obs_freeze_guard is not None:
+        from humanoidverse.training.obs_normalizer_sync import require_guard
+        require_guard(obs_freeze_guard)
+        obs_freeze_guard.check("sync_before", coordinate, module)
+        protected_ids = obs_freeze_guard.protected_ids(module, "sync_before")
+    else:
+        protected_ids = frozenset()
     if not is_distributed():
+        if obs_freeze_guard is not None:
+            obs_freeze_guard.check("sync_after", coordinate, module)
         return
     floating = [
         buffer
         for buffer in module.buffers()
-        if buffer.dtype.is_floating_point or buffer.dtype.is_complex
+        if id(buffer) not in protected_ids and (buffer.dtype.is_floating_point or buffer.dtype.is_complex)
     ]
     if floating:
         scale = 1.0 / float(dist.get_world_size())
@@ -89,8 +109,10 @@ def sync_floating_buffers(module: torch.nn.Module, src: int = 0) -> None:
                 buffer.copy_(flat[offset : offset + count].view_as(buffer))
                 offset += count
     for buffer in module.buffers():
-        if not (buffer.dtype.is_floating_point or buffer.dtype.is_complex):
+        if id(buffer) not in protected_ids and not (buffer.dtype.is_floating_point or buffer.dtype.is_complex):
             dist.broadcast(buffer.data, src=src)
+    if obs_freeze_guard is not None:
+        obs_freeze_guard.check("sync_after", coordinate, module)
 
 
 @torch.compiler.disable
@@ -115,10 +137,10 @@ def agent_optimizers(agent: Any) -> list[torch.optim.Optimizer]:
     return [getattr(agent, name) for name in names if hasattr(agent, name)]
 
 
-def broadcast_agent_state(agent: Any, src: int = 0) -> None:
-    if not is_distributed():
+def broadcast_agent_state(agent: Any, src: int = 0, *, obs_freeze_guard=None, coordinate=None) -> None:
+    if not is_distributed() and obs_freeze_guard is None:
         return
-    broadcast_module_state(agent._model, src=src)
+    broadcast_module_state(agent._model, src=src, obs_freeze_guard=obs_freeze_guard, coordinate=coordinate)
     for optimizer in agent_optimizers(agent):
         broadcast_optimizer_state(optimizer, src=src)
 

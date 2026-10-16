@@ -23,6 +23,7 @@ class FBcprAuxAgentTrainConfig(FBcprAgentTrainConfig):
     lr_aux_critic: float = 1e-4
     reg_coeff_aux: float = 1.0
     aux_critic_pessimism_penalty: float = 0.5
+    freeze_obs_normalizer_stats: pydantic.StrictBool = False
 
 
 class FBcprAuxAgentConfig(BaseConfig):
@@ -96,8 +97,9 @@ class FBcprAuxAgent(FBcprAgent):
             tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
         )
 
-        self._model._obs_normalizer(train_obs)
-        self._model._obs_normalizer(train_next_obs)
+        if not self.cfg.train.freeze_obs_normalizer_stats:
+            self._model._obs_normalizer(train_obs)
+            self._model._obs_normalizer(train_next_obs)
 
         with torch.no_grad(), eval_mode(self._model._obs_normalizer):
             train_obs, train_next_obs = (

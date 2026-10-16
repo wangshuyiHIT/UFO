@@ -46,6 +46,7 @@ from humanoidverse.agents.utils import EveryNStepsChecker, get_local_workdir, se
 from humanoidverse.distributed import average_metrics, barrier, broadcast_agent_state, broadcast_object, module_sync_report, sync_floating_buffers
 from humanoidverse.training.checkpoint_io import CheckpointCoordinator, ReplayWarmup, resolve_checkpoint, transactional_save
 from humanoidverse.training.progress import TrainingProgress, progress_phase
+from humanoidverse.training.obs_normalizer_resume import (PolicyBinding, verify_contract, verify_restored, verify_no_unbound_change)
 
 TRAIN_LOG_FILENAME = "train_log.txt"
 REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
@@ -123,6 +124,7 @@ class TrainConfig(BaseConfig):
     transactional_checkpoints: bool = False
     checkpoint_reserve_gib: float = pydantic.Field(default=4.0, ge=0, allow_inf_nan=False)
     checkpoint_timeout_seconds: float = pydantic.Field(default=300.0, gt=0, allow_inf_nan=False)
+    obs_normalizer_resume_policy: PolicyBinding | None = None
     warm_start: dict | None = None
     initialization_provenance: dict | None = None
     training_data_provenance: dict | None = None
@@ -231,11 +233,24 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
             f"Loading the agent at local_time={checkpoint_status['local_time']} "
             f"global_time={checkpoint_status['global_time']} optimizer_steps={checkpoint_status['optimizer_steps']}"
         )
-        agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device)
+        if cfg.obs_normalizer_resume_policy is None:
+            if cfg.agent.name == "FBcprAuxAgent":
+                verify_no_unbound_change(checkpoint_dir, cfg.model_dump())
+            agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device)
+        else:
+            target_effective = cfg.model_dump()
+            target_effective["initialization_provenance"] = json.loads((checkpoint_dir / "effective_train_config.json").read_text()).get("initialization_provenance")
+            binding = cfg.obs_normalizer_resume_policy.model_dump()
+            verify_contract(binding, checkpoint_dir, target_effective)
+            agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device,
+                obs_normalizer_policy={"binding": binding, "target_effective": target_effective})
+            verify_restored(agent, target_effective)
         effective = checkpoint_dir / "effective_train_config.json"
         if effective.exists():
             cfg = cfg.model_copy(update={"initialization_provenance": json.loads(effective.read_text()).get("initialization_provenance")})
     else:
+        if cfg.obs_normalizer_resume_policy is not None:
+            raise ValueError("Restore policy cannot authorize fresh agent construction")
         agent = cfg.agent.build(**agent_build_kwargs)
         if cfg.warm_start is not None:
             from humanoidverse.training.warm_start import inspect_source, initialize_model
@@ -245,6 +260,27 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
             # initializer when a later checkpoint is resumed normally.
             cfg = cfg.model_copy(update={"initialization_provenance": provenance, "warm_start": None})
     return agent, cfg, checkpoint_status
+
+
+def create_agent_or_load_checkpoint_coordinated(work_dir, cfg, agent_build_kwargs, *, coordinator, warm_start_source=None):
+    """Default dispatch unchanged; explicit restore failures meet the existing control group."""
+    if cfg.obs_normalizer_resume_policy is None:
+        return create_agent_or_load_checkpoint(work_dir, cfg, agent_build_kwargs, warm_start_source=warm_start_source)
+    from humanoidverse.training.obs_normalizer_sync import SourceBufferGuard, RuntimeRank
+    if coordinator is None:
+        raise ValueError("Explicit frozen restore requires transactional checkpoint coordinator")
+    local = {}
+    def restore_and_check():
+        result = create_agent_or_load_checkpoint(work_dir, cfg, agent_build_kwargs, warm_start_source=warm_start_source)
+        agent = result[0]
+        agent._obs_freeze_guard = SourceBufferGuard(agent, getattr(agent, "_obs_freeze_admission", None),
+            RuntimeRank(cfg.distributed_rank, cfg.distributed_world_size), coordinator)
+        agent._obs_freeze_guard.runtime_cfg = result[1]
+        local["result"] = result
+        return {"restored_and_source_checked": True}
+    # Only the small status is gathered, never model tensors or optimizer state.
+    coordinator.stage("frozen observation restore and independent source baseline", restore_and_check)
+    return local["result"]
 
 
 def _global_step_scale(cfg: TrainConfig) -> int:
@@ -512,9 +548,9 @@ class Workspace:
 
         set_seed_everywhere(self.cfg.seed)
 
-        self.agent, self.cfg, self._checkpoint_status = create_agent_or_load_checkpoint(
+        self.agent, self.cfg, self._checkpoint_status = create_agent_or_load_checkpoint_coordinated(
             self.work_dir, self.cfg, agent_build_kwargs=dict(obs_space=self.obs_space, action_dim=self.action_dim),
-            warm_start_source=self._warm_start_source,
+            warm_start_source=self._warm_start_source, coordinator=self._checkpoint_coordinator,
         )
         if self._write_shared_artifacts and self._warm_start_source is not None:
             (self.work_dir / "warm_start_receipt.json").write_text(json.dumps(self.cfg.initialization_provenance, indent=2) + "\n")
@@ -522,8 +558,8 @@ class Workspace:
         self._checkpoint_global_time = int(self._checkpoint_status["global_time"])
         self._optimizer_steps = int(self._checkpoint_status["optimizer_steps"])
         self._last_checkpoint_position = (self._checkpoint_local_time, self._checkpoint_global_time, self._optimizer_steps)
-        if self.cfg.distributed_sync:
-            broadcast_agent_state(self.agent, src=0)
+        self._obs_freeze_guard = getattr(self.agent, "_obs_freeze_guard", None)
+        self._broadcast_agent_after_restore()
         self.agent._model.train()
 
         if isinstance(self.cfg.evaluations, list):
@@ -639,6 +675,60 @@ class Workspace:
                     }
                 )
             return metrics
+
+    def _broadcast_agent_after_restore(self):
+        guard = self._obs_freeze_guard
+        if guard is not None: guard.runtime_cfg = self.cfg
+        coordinate = {"optimizer_steps": self._optimizer_steps, "local_time": self._checkpoint_local_time,
+                      "global_time": self._checkpoint_global_time}
+        if self.cfg.distributed_sync:
+            broadcast_agent_state(self.agent, src=0, obs_freeze_guard=guard, coordinate=coordinate)
+        elif guard is not None:
+            # Check the boundary without turning disabled model synchronization on.
+            guard.check("initial_broadcast_before", coordinate)
+            guard.check("initial_broadcast_after", coordinate)
+
+    def _update_agent_and_sync(self, replay_buffer, local_time, global_time):
+        """Original update/finite/sync order, with opt-in checks around state mutations."""
+        from contextlib import nullcontext
+        guard = getattr(self, "_obs_freeze_guard", None)
+        if guard is not None: guard.runtime_cfg = self.cfg
+        def coordinate():
+            return {"optimizer_steps": self._optimizer_steps, "local_time": local_time, "global_time": global_time}
+        if guard is not None:
+            guard.check("update_before", coordinate())
+        # Failures inside native update/collectives retain existing process-group/guardian bounds.
+        metrics = self.agent.update(replay_buffer, local_time)
+        self._optimizer_steps += 1
+        if guard is not None:
+            guard.check("update_after", coordinate())
+        with guard.coordinate_local_errors("post-update finite checks") if guard is not None else nullcontext():
+            if self.cfg.fail_on_nonfinite:
+                _assert_finite(
+                    metrics,
+                    label="agent.update.metrics",
+                    rank=self.distributed_rank,
+                    local_time=local_time,
+                    global_time=global_time,
+                    optimizer_steps=self._optimizer_steps,
+                )
+                if (
+                    self.cfg.nonfinite_check_model_every_updates > 0
+                    and self._optimizer_steps % self.cfg.nonfinite_check_model_every_updates == 0
+                ):
+                    _assert_model_finite(
+                        self.agent._model,
+                        rank=self.distributed_rank,
+                        local_time=local_time,
+                        global_time=global_time,
+                        optimizer_steps=self._optimizer_steps,
+                    )
+        if self.cfg.distributed_sync:
+            sync_floating_buffers(self.agent._model, obs_freeze_guard=guard, coordinate=coordinate())
+        elif guard is not None:
+            guard.check("sync_before", coordinate())
+            guard.check("sync_after", coordinate())
+        return metrics
 
     def train_online(self) -> None:
         if self.training_with_expert_data:
@@ -1041,30 +1131,7 @@ class Workspace:
                 update_agent_time_checker.update_last_step(local_time)
                 update_t0 = time.time()
                 for _ in range(self.cfg.num_agent_updates):
-                    metrics = self.agent.update(replay_buffer, local_time)
-                    self._optimizer_steps += 1
-                    if self.cfg.fail_on_nonfinite:
-                        _assert_finite(
-                            metrics,
-                            label="agent.update.metrics",
-                            rank=self.distributed_rank,
-                            local_time=local_time,
-                            global_time=global_time,
-                            optimizer_steps=self._optimizer_steps,
-                        )
-                        if (
-                            self.cfg.nonfinite_check_model_every_updates > 0
-                            and self._optimizer_steps % self.cfg.nonfinite_check_model_every_updates == 0
-                        ):
-                            _assert_model_finite(
-                                self.agent._model,
-                                rank=self.distributed_rank,
-                                local_time=local_time,
-                                global_time=global_time,
-                                optimizer_steps=self._optimizer_steps,
-                            )
-                    if self.cfg.distributed_sync:
-                        sync_floating_buffers(self.agent._model)
+                    metrics = self._update_agent_and_sync(replay_buffer, local_time, global_time)
                     if self.cfg.distributed_sync and self.cfg.distributed_average_metrics:
                         metrics = average_metrics(metrics)
                     total_metrics, metric_update_counts = _accumulate_metrics(

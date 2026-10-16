@@ -346,9 +346,8 @@ def _init_distributed(local_rank: int, world_size: int) -> None:
             dist.init_process_group(**init_kwargs)
 
 
-def run_train(args: argparse.Namespace, log_dir: Path) -> None:
-    device, _local_rank, rank, world_size = _select_device_and_rank(args.seed)
-    _init_distributed(_local_rank, world_size)
+def compose_training_config(args, log_dir, *, device, rank, world_size):
+    """Original run_train config expression, callable before launch without model/env creation."""
     seed = args.seed + rank
     cfg = build_ufo_mjlab_config(
         device=device,
@@ -393,6 +392,18 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
                         if args.warm_start_launch_receipt else {})} if args.warm_start_generation else None),
         training_data_provenance=(json.loads(args.training_data_provenance_json) if args.training_data_provenance_json else None),
     )
+    return cfg
+
+
+def run_train(args: argparse.Namespace, log_dir: Path, *, obs_normalizer_policy_binding=None) -> None:
+    device, _local_rank, rank, world_size = _select_device_and_rank(args.seed)
+    _init_distributed(_local_rank, world_size)
+    seed = args.seed + rank
+    cfg = compose_training_config(args, log_dir, device=device, rank=rank, world_size=world_size)
+    if obs_normalizer_policy_binding is not None:
+        from humanoidverse.training.obs_rank_contract import bind_train_config
+        cfg = bind_train_config(cfg, obs_normalizer_policy_binding, base_seed=args.seed,
+            use_wandb_cli=args.use_wandb, rank=rank, local_rank=_local_rank, world_size=world_size)
     print(
         "[INFO] UFO train: "
         f"agent={args.agent}, device={device}, rank={rank}/{world_size}, seed={seed}, work_dir={log_dir}, "
@@ -473,7 +484,7 @@ def launch(args: argparse.Namespace) -> None:
     ).run(run_train, args, log_dir)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train UFO.")
     parser.add_argument(
         "--agent",
@@ -581,7 +592,7 @@ def parse_args() -> argparse.Namespace:
         help="Validation/debug only: skip tracking eval and expert prioritization without changing default training behavior.",
     )
     parser.add_argument("--smoke", action="store_true", help="Short local smoke settings: 16 envs, 2048 env steps, no W&B.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if any((args.warm_start_generation, args.warm_start_manifest_sha256, args.warm_start_model_sha256)) and not all((args.warm_start_generation, args.warm_start_manifest_sha256, args.warm_start_model_sha256)):
         parser.error("Warm-start requires generation, COMMITTED SHA256 and model SHA256 together")
     if any((args.warm_start_launch_receipt, args.warm_start_launch_receipt_sha256)) and not all((args.warm_start_generation, args.warm_start_launch_receipt, args.warm_start_launch_receipt_sha256)):
