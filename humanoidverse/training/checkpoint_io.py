@@ -12,7 +12,7 @@ import math
 import os
 import shutil
 import uuid
-import warnings
+import sys
 from collections.abc import Mapping
 from datetime import timedelta
 from dataclasses import dataclass
@@ -106,6 +106,13 @@ def resolve_checkpoint(work_dir: Path, *, transactional: bool) -> Path:
     return checkpoint
 
 
+class CheckpointFailure(RuntimeError):
+    """A terminal outcome, never authority to resume a partially finished save."""
+    def __init__(self, message: str, outcome: dict):
+        super().__init__(message)
+        self.checkpoint_outcome = dict(outcome)
+
+
 class CheckpointStore:
     def __init__(self, work_dir: Path, *, reserve_gib: float = 4.0):
         if not math.isfinite(reserve_gib) or reserve_gib < 0:
@@ -116,58 +123,97 @@ class CheckpointStore:
         self.stage = None
         self.lock = None
         self.previous = None
+        self.attempted_generation = None
+        self.published_generation = None
+        self.phase = "new"
+        self.terminal = False
+        self.closed = False
+        self.failure = None
+        self.close_error = None
+
+    def _outcome(self, status: str) -> dict:
+        return {"status": status,
+                "attempted_generation": str(self.attempted_generation) if self.attempted_generation else None,
+                "published_generation": str(self.published_generation) if self.published_generation else None,
+                "retained_stage": str(self.stage) if self.stage else None,
+                "previous_generation": self.previous,
+                "durability_complete": False, "retry_allowed": False}
+
+    def _fail(self, exc: BaseException) -> dict:
+        status = ("published_tail_failure" if self.published_generation is not None else
+                  "publication_unknown" if self.phase == "publication_unknown" else "unpublished_failure")
+        self.terminal = True
+        if self.failure is None:
+            self.failure = self._outcome(status)
+        return dict(self.failure)
+
+    def _guard(self, phase: str) -> None:
+        if self.closed or self.terminal or self.phase != phase:
+            self.terminal = True
+            if self.failure is None:
+                self.failure = self._outcome("reentry_forbidden")
+            raise CheckpointFailure("Checkpoint transaction is single-use; reentry forbidden",
+                                    self.failure)
 
     def begin(self, estimated_bytes: int) -> Path:
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.lock = (self.work_dir / ".checkpoint.lock").open("a")
-        fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        current = resolve_checkpoint(self.work_dir, transactional=True)
-        if current.is_dir():
-            self.previous = current.name
-            estimated_bytes = max(estimated_bytes, sum(p.stat().st_size for p in current.rglob("*") if p.is_file()))
-        required = math.ceil(max(estimated_bytes, 0) * 1.2) + self.reserve_bytes
-        available = shutil.disk_usage(self.work_dir).free
-        if available < required:
-            raise OSError(f"Checkpoint needs {required} free bytes (one generation plus reserve), has {available}; previous generation retained")
-        self.root.mkdir(exist_ok=True)
-        self.stage = self.root / ("generation-" + uuid.uuid4().hex)
-        self.stage.mkdir()
-        return self.stage
+        self._guard("new")
+        self.phase = "beginning"
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            self.lock = (self.work_dir / ".checkpoint.lock").open("a")
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = resolve_checkpoint(self.work_dir, transactional=True)
+            if current.is_dir():
+                self.previous = current.name
+                estimated_bytes = max(estimated_bytes, sum(p.stat().st_size for p in current.rglob("*") if p.is_file()))
+            required = math.ceil(max(estimated_bytes, 0) * 1.2) + self.reserve_bytes
+            available = shutil.disk_usage(self.work_dir).free
+            if available < required:
+                raise OSError(f"Checkpoint needs {required} free bytes (one generation plus reserve), has {available}")
+            self.root.mkdir(exist_ok=True)
+            self.stage = self.root / ("generation-" + uuid.uuid4().hex)
+            self.stage.mkdir()
+            self.attempted_generation = self.stage
+            self.phase = "writing"
+            return self.stage
+        except BaseException as exc:
+            outcome = self._fail(exc)
+            if isinstance(exc, Exception):
+                raise CheckpointFailure(f"Checkpoint begin failed: {type(exc).__name__}: {exc}", outcome) from exc
+            raise
 
     def commit(self, *, expected_buffers: tuple[str, ...] = (), fault_hook=None) -> Path:
+        self._guard("writing")
         stage = self.stage
-        if stage is None:
-            raise RuntimeError("Checkpoint transaction has not started")
-        for relative in (*REQUIRED, *expected_buffers):
-            if not (stage / relative).is_file():
-                raise RuntimeError(f"Missing staged checkpoint artifact: {relative}")
-        files = {}
-        for item in sorted(stage.rglob("*")):
-            if item.is_symlink():
-                raise RuntimeError("Symlinks are not permitted inside a checkpoint generation")
-            if item.is_file():
-                files[str(item.relative_to(stage))] = {"bytes": item.stat().st_size, "sha256": file_digest(item)}
-        manifest = {"version": 1, "previous": self.previous, "files": files}
-        (stage / "COMMITTED.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        for item in stage.rglob("*"):
-            if item.is_file():
-                with item.open("rb") as stream:
-                    os.fsync(stream.fileno())
-        for directory in sorted([stage, *(p for p in stage.rglob("*") if p.is_dir())], key=lambda p: len(p.parts), reverse=True):
-            _fsync_dir(directory)
-        _fsync_dir(self.root)
-        pointer = self.work_dir / (".checkpoint-pointer-" + uuid.uuid4().hex)
         try:
+            for relative in (*REQUIRED, *expected_buffers):
+                if not (stage / relative).is_file():
+                    raise RuntimeError(f"Missing staged checkpoint artifact: {relative}")
+            files = {}
+            for item in sorted(stage.rglob("*")):
+                if item.is_symlink():
+                    raise RuntimeError("Symlinks are not permitted inside a checkpoint generation")
+                if item.is_file():
+                    files[str(item.relative_to(stage))] = {"bytes": item.stat().st_size, "sha256": file_digest(item)}
+            manifest = {"version": 1, "previous": self.previous, "files": files}
+            (stage / "COMMITTED.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            for item in stage.rglob("*"):
+                if item.is_file():
+                    with item.open("rb") as stream:
+                        os.fsync(stream.fileno())
+            for directory in sorted([stage, *(p for p in stage.rglob("*") if p.is_dir())], key=lambda p: len(p.parts), reverse=True):
+                _fsync_dir(directory)
+            _fsync_dir(self.root)
+            pointer = self.work_dir / (".checkpoint-pointer-" + uuid.uuid4().hex)
             pointer.symlink_to(Path(GENERATIONS) / stage.name)
             if fault_hook:
                 fault_hook("before_publish")
+            # An exception from replace cannot prove whether publication happened.
+            self.phase = "publication_unknown"
             os.replace(pointer, self.work_dir / "checkpoint")
-        finally:
+            # No I/O between successful publication and clearing stage ownership.
+            self.published_generation, self.stage, self.phase = stage, None, "published"
             pointer.unlink(missing_ok=True)
-        # Publication is the commit point. Cleanup/directory-sync failures after
-        # it must not report a failed save or remove the now-current generation.
-        self.stage = None
-        try:
             _fsync_dir(self.work_dir)
             for candidate in self.root.iterdir():
                 if (candidate.is_dir() and not candidate.is_symlink()
@@ -175,17 +221,32 @@ class CheckpointStore:
                         and candidate.name not in {stage.name, self.previous}):
                     shutil.rmtree(candidate)
             _fsync_dir(self.root)
-        except OSError as exc:
-            warnings.warn(f"Checkpoint committed; durability/retention cleanup needs attention: {exc}")
-        return stage
+            self.phase = "complete"
+            return stage
+        except BaseException as exc:
+            outcome = self._fail(exc)
+            if isinstance(exc, Exception):
+                raise CheckpointFailure(f"Checkpoint commit failed: {type(exc).__name__}: {exc}", outcome) from exc
+            raise
 
     def close(self) -> None:
-        if self.stage is not None:
-            shutil.rmtree(self.stage, ignore_errors=True)
-            self.stage = None
-        if self.lock is not None:
-            self.lock.close()
-            self.lock = None
+        # Failed stages and uncertain/current generations are evidence, not cleanup
+        # targets. The original graph is terminal; disk state never grants a retry.
+        original_exception = sys.exc_info()[0] is not None
+        if self.phase not in {"new", "complete"} and not self.terminal:
+            self._fail(RuntimeError("Checkpoint closed before completion"))
+        self.closed = True
+        lock, self.lock = self.lock, None
+        if lock is not None:
+            try:
+                lock.close()
+            except BaseException as exc:
+                self.close_error = type(exc).__name__
+                outcome = self._fail(exc)
+                if not original_exception:
+                    if isinstance(exc, Exception):
+                        raise CheckpointFailure("Checkpoint lock release failed", outcome) from exc
+                    raise
 
 
 class CheckpointCoordinator:
@@ -211,16 +272,41 @@ class CheckpointCoordinator:
         dist.all_gather_object(gathered, value, group=self.group)
         return gathered
 
-    def stage(self, name, callback):
-        value = error = None
+    def stage(self, name, callback, *, failure_outcome=None):
+        value = error = outcome = None
         try:
             value = callback()
         except Exception as exc:
             error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
-        results = self.gather({"error": error, "value": value})
+            outcome = getattr(exc, "checkpoint_outcome", None)
+            if outcome is None and failure_outcome is not None:
+                outcome = failure_outcome(exc)
+            if outcome is None:
+                outcome = {"status": "publication_unknown" if name == "publication" else "unpublished_failure",
+                           "attempted_generation": None, "published_generation": None,
+                           "retained_stage": None, "previous_generation": None,
+                           "durability_complete": False, "retry_allowed": False}
+        # Same one collective at the original checkpoint boundary, with an exact
+        # outcome field; peers never infer CURRENT from rank number or error text.
+        try:
+            results = self.gather({"error": error, "value": value, "outcome": outcome})
+        except Exception as exc:
+            if outcome is None and failure_outcome is not None:
+                outcome = failure_outcome(exc)
+            failure = RuntimeError(f"Checkpoint {name} collective failed; collective_outcome=unknown; "
+                                   f"local_outcome={json.dumps(outcome, sort_keys=True)}; terminal, no retry")
+            failure.checkpoint_collective_outcome = "unknown"
+            failure.checkpoint_local_outcome = outcome
+            raise failure from exc
         errors = [item["error"] for item in results if item["error"]]
         if errors:
-            raise RuntimeError(f"Checkpoint {name} failed; previous generation retained: " + "; ".join(errors))
+            outcomes = [item["outcome"] for item in results if item["error"]]
+            if outcome is None and failure_outcome is not None:
+                outcomes.append(failure_outcome(RuntimeError("Peer checkpoint failure")))
+            failure = RuntimeError(f"Checkpoint {name} failed; terminal, no retry; outcomes="
+                                   + json.dumps(outcomes, sort_keys=True) + ": " + "; ".join(errors))
+            failure.checkpoint_outcomes = outcomes
+            raise failure
         return [item["value"] for item in results]
 
 
@@ -273,12 +359,17 @@ def transactional_save(workspace, *, train_status: dict, replay_buffer: dict, fa
                 (stage / "effective_train_config.json").write_text(cfg.model_dump_json(indent=2))
             if fault_hook:
                 fault_hook("after_write")
-        coordinator.stage("write", write)
+        coordinator.stage("write", write, failure_outcome=store._fail if store is not None else None)
         expected = ()
         if cfg.checkpoint_buffer:
             expected = tuple(f"buffers/train_rank_{worker}/buffer.hdf5" for worker in range(coordinator.world_size)) if coordinator.world_size > 1 else ("buffers/train/buffer.hdf5",)
-        coordinator.stage("publication", lambda: str(store.commit(expected_buffers=expected, fault_hook=fault_hook)) if rank == 0 else None)
+        coordinator.stage("publication", lambda: str(store.commit(expected_buffers=expected, fault_hook=fault_hook)) if rank == 0 else None,
+                          failure_outcome=store._fail if store is not None else None)
         return stage
+    except BaseException as exc:
+        if store is not None:
+            store._fail(exc)
+        raise
     finally:
         if store is not None:
             store.close()

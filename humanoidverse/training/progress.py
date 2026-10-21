@@ -13,6 +13,8 @@ from pathlib import Path
 import tempfile
 import time
 import uuid
+import re
+from . import metadata_output
 
 
 SCHEMA = "ufo_training_progress_v1"
@@ -23,6 +25,26 @@ def _counter(value, name):
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
+
+
+def _validate_previous(value):
+    base = {"schema", "run_id", "pid", "rank", "run_started_unix_s", "observed_at_unix_s", "elapsed_s", "phase", "phase_started_unix_s", "phase_elapsed_s", "global_time", "optimizer_steps", "sequence", "resume_global_time", "resume_optimizer_steps"}
+    prior = {"prior_run_id", "resume_rollback_global_time", "resume_rollback_optimizer_steps"}
+    if type(value) is not dict or set(value) not in (base, base | prior):
+        raise ValueError("Previous progress keys differ")
+    if value["schema"] != SCHEMA or value["phase"] not in PHASES or value["rank"] != 0 or type(value["rank"]) is not int:
+        raise ValueError("Previous progress identity differs")
+    for name in ("run_id", "prior_run_id"):
+        if name in value and (type(value[name]) is not str or re.fullmatch("[0-9a-f]{32}", value[name]) is None):
+            raise ValueError("Previous progress run ID differs")
+    for name in ("pid", "global_time", "optimizer_steps", "sequence", "resume_global_time", "resume_optimizer_steps", "resume_rollback_global_time", "resume_rollback_optimizer_steps"):
+        if name in value:
+            _counter(value[name], name)
+    if value["pid"] == 0 or value["sequence"] == 0:
+        raise ValueError("Previous progress positive identity differs")
+    for name in ("run_started_unix_s", "observed_at_unix_s", "elapsed_s", "phase_started_unix_s", "phase_elapsed_s"):
+        if type(value[name]) not in (int, float) or not math.isfinite(value[name]) or value[name] < 0:
+            raise ValueError("Previous progress time type differs")
 
 
 class TrainingProgress:
@@ -37,6 +59,7 @@ class TrainingProgress:
                  interval_seconds: float = 10.0):
         if not math.isfinite(interval_seconds) or interval_seconds <= 0:
             raise ValueError("progress interval must be finite and positive")
+        self._output_failed = False
         self.path = Path(path)
         self.interval_seconds = interval_seconds
         self.global_time = _counter(global_time, "global_time")
@@ -51,7 +74,8 @@ class TrainingProgress:
         self.sequence = 0
         self.resume = {"resume_global_time": global_time, "resume_optimizer_steps": optimizer_steps}
         if self.path.exists():
-            previous = json.loads(self.path.read_text())
+            previous = json.loads(metadata_output.read_text(self.path, kind="progress"))
+            _validate_previous(previous)
             if previous.get("schema") != SCHEMA or not isinstance(previous.get("run_id"), str):
                 raise ValueError("Existing training progress receipt has an invalid schema/run ID")
             old_global = _counter(previous.get("global_time"), "previous global_time")
@@ -61,7 +85,16 @@ class TrainingProgress:
                                resume_rollback_optimizer_steps=max(0, old_updates-optimizer_steps))
         self.update(force=True)
 
-    def update(self, *, global_time=None, optimizer_steps=None, phase=None, force=False):
+    def update(self, **kwargs):
+        if self._output_failed:
+            raise RuntimeError("Metadata output failure is latched; no later progress temporary permitted")
+        try:
+            return self._update(**kwargs)
+        except BaseException:
+            self._output_failed = True
+            raise
+
+    def _update(self, *, global_time=None, optimizer_steps=None, phase=None, force=False):
         global_time = self.global_time if global_time is None else _counter(global_time, "global_time")
         optimizer_steps = self.optimizer_steps if optimizer_steps is None else _counter(optimizer_steps, "optimizer_steps")
         phase = self.phase if phase is None else phase
@@ -85,14 +118,15 @@ class TrainingProgress:
                        phase_started_unix_s=self.phase_started_unix_s, phase_elapsed_s=tick-self.phase_started,
                        global_time=self.global_time, optimizer_steps=self.optimizer_steps,
                        sequence=self.sequence+1, **self.resume)
+        raw = metadata_output.encode_text(self.path, json.dumps(receipt, allow_nan=False) + "\n", kind="progress")
         temporary = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent,
+            with tempfile.NamedTemporaryFile(mode="wb", dir=self.path.parent,
                                              prefix=".training-progress-", delete=False) as stream:
                 temporary = Path(stream.name)
-                json.dump(receipt, stream, allow_nan=False)
-                stream.write("\n")
+                if stream.write(raw) != len(raw):
+                    raise OSError("Short progress metadata write")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)

@@ -19,6 +19,7 @@ import torch
 torch.set_float32_matmul_precision("high")
 
 import json
+import io
 import time
 import typing as tp
 import warnings
@@ -46,6 +47,7 @@ from humanoidverse.agents.utils import EveryNStepsChecker, get_local_workdir, se
 from humanoidverse.distributed import average_metrics, barrier, broadcast_agent_state, broadcast_object, module_sync_report, sync_floating_buffers
 from humanoidverse.training.checkpoint_io import CheckpointCoordinator, ReplayWarmup, resolve_checkpoint, transactional_save
 from humanoidverse.training.progress import TrainingProgress, progress_phase
+from humanoidverse.training import metadata_output
 from humanoidverse.training.obs_normalizer_resume import (PolicyBinding, verify_contract, verify_restored, verify_no_unbound_change)
 
 TRAIN_LOG_FILENAME = "train_log.txt"
@@ -541,8 +543,9 @@ class Workspace:
         self.work_dir.mkdir(exist_ok=True, parents=True)
 
         if self._write_shared_artifacts and isinstance(cfg.env, HumanoidVerseMjlabConfig):
-            with open(self.work_dir / "config.yaml", "w") as file:
-                OmegaConf.save(self.train_env_info["unresolved_conf"], file)
+            metadata_stream = io.StringIO()
+            OmegaConf.save(self.train_env_info["unresolved_conf"], metadata_stream)
+            metadata_output.write_text(self.work_dir / "config.yaml", metadata_stream.getvalue(), kind="work_yaml")
 
         self.train_logger = CSVLogger(filename=self.work_dir / TRAIN_LOG_FILENAME) if self._write_shared_artifacts else None
 
@@ -553,7 +556,7 @@ class Workspace:
             warm_start_source=self._warm_start_source, coordinator=self._checkpoint_coordinator,
         )
         if self._write_shared_artifacts and self._warm_start_source is not None:
-            (self.work_dir / "warm_start_receipt.json").write_text(json.dumps(self.cfg.initialization_provenance, indent=2) + "\n")
+            metadata_output.write_text(self.work_dir / "warm_start_receipt.json", json.dumps(self.cfg.initialization_provenance, indent=2) + "\n", kind="warm_start")
         self._checkpoint_local_time = int(self._checkpoint_status["local_time"])
         self._checkpoint_global_time = int(self._checkpoint_status["global_time"])
         self._optimizer_steps = int(self._checkpoint_status["optimizer_steps"])
@@ -576,8 +579,7 @@ class Workspace:
             init_wandb(self.cfg)
 
         if self._write_shared_artifacts:
-            with (self.work_dir / "config.json").open("w") as f:
-                f.write(self.cfg.model_dump_json(indent=4))
+            metadata_output.write_text(self.work_dir / "config.json", self.cfg.model_dump_json(indent=4), kind="work_json")
 
         self.priorization_eval_name = None
         if self.cfg.prioritization:

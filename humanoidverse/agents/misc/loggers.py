@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Union
 import mediapy
 
 import pandas as pd
+from . import csv_output
 
 def logfile_to_video_directory(logfile: str | Path):
     log_dir = Path(logfile).parent
@@ -26,10 +27,9 @@ class CSVLogger:
     fields: Optional[List[str]] = None
 
     def log(self, log_data: Dict[str, Any]) -> None:
+        write_header = self.fields is None and not Path(self.filename).exists()
         if self.fields is None:
             self.fields = sorted(list(log_data.keys()))
-            if not Path(self.filename).exists():
-                pd.DataFrame(columns=self.fields).to_csv(self.filename, index=False)
 
         data = {field: log_data.get(field, "") for field in self.fields}  # Ensure all fields are present
         islist = [isinstance(v, Iterable) and not isinstance(v, str) for k, v in data.items()]
@@ -39,7 +39,7 @@ class CSVLogger:
             df = pd.DataFrame([data])
         else:
             raise RuntimeError("Fields should all be a numbers, a string or iterable objects. We don't support mixed types.")
-        df.to_csv(self.filename, mode="a", header=False, index=False)
+        csv_output.append(self.filename, self.fields, df, write_header=write_header)
 
     def log_video(self, filename: str, frames: list[np.ndarray], fps: int) -> None:
         # Implement video logging logic here
